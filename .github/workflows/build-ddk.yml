@@ -24,6 +24,12 @@ on:
       - "**.md"
   workflow_dispatch:
 
+# Least privilege for GITHUB_TOKEN: this workflow only checks the repository out, and its own artifact
+# uploads are covered by the runtime token - no scope beyond reading the contents is needed.  CodeQL's
+# actions analysis flagged the missing block twice as actions/missing-workflow-permissions.
+permissions:
+  contents: read
+
 jobs:
   # One .ko per GKI (kernel version × Android release) combination that exists.  A module is NOT portable across these
   # (vermagic/KMI differ, and so do the LSM hook prototypes this module hooks by offset), so every combination the DDK
