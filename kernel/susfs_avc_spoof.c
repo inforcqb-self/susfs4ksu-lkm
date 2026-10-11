@@ -135,6 +135,9 @@ static void avc_unregister_locked(void)
 	 * way to restart the spoof, and it used to end with the hook permanently gone. */
 	susfs_kp_forget_addr(&kp_avc);
 	avc_registered = false;
+	/* Reported only for a real disarm: writing '0' when nothing was armed (or a second disable)
+	 * used to be silent and must stay silent. */
+	SUSFS_LOGI("susfs_avc_spoof: hook removed\n");
 }
 
 static void avc_unregister(void)
@@ -142,7 +145,6 @@ static void avc_unregister(void)
 	mutex_lock(&avc_ctl_lock);
 	avc_unregister_locked();
 	mutex_unlock(&avc_ctl_lock);
-	SUSFS_LOGI("susfs_avc_spoof: hook removed\n");
 }
 
 static int avc_proc_show(struct seq_file *m, void *v)

@@ -735,7 +735,11 @@ void susfs_sus_map_exit(void)
     map_registered = false;
     mutex_unlock(&map_ctl_lock);
 
-    nmap = 0;
+    /* Published the way sus_map_add_full() does it (smp_store_release against the
+     * smp_load_acquire readers); a plain store would break that protocol.  No reader can be live
+     * by now - every probe is unregistered above - but the write should still have the right
+     * shape. */
+    smp_store_release(&nmap, 0);
 }
 
 /* supercall: CMD_SUSFS_ADD_SUS_MAP (resolve path -> ino/dev, register hook) */

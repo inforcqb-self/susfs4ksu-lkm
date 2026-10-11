@@ -473,7 +473,10 @@ static void kstat_maps_disarm(void)
 {
 	mutex_lock(&kstat_maps_ctl_lock);
 	/* The only caller is susfs_kstat_exit(), so "stop accepting arms" and "drop the probe" can
-	 * be one critical section - exactly what the /proc-reachable arm path needs. */
+	 * be one critical section - exactly what the /proc-reachable arm path needs.  If a runtime
+	 * disarm is ever wanted (say for `clear`), it must NOT come through here: the flag is
+	 * permanent, so disarming at runtime would make kstat_maps_arm() refuse for the rest of the
+	 * module's life.  Such a caller needs its own _locked() variant. */
 	kstat_maps_exiting = true;
 	if (!kstat_maps_registered) {
 		mutex_unlock(&kstat_maps_ctl_lock);
