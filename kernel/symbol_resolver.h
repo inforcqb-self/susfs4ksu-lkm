@@ -14,7 +14,15 @@ int ksu_find_symbol_all(const char *name, unsigned long *addrs, int max);
  * does not sleep, so it is usable from atomic context. */
 unsigned long ksu_kallsyms_lookup_name(const char *name);
 int ksu_symbol_name_of(unsigned long addr, char *buf, char **module_out);
+/* Non-zero iff @addr is the first instruction of a core-kernel function named @name.  Both
+ * directions are asked because each has a blind spot: address -> name through kallsyms_lookup()
+ * (cleaned spelling, offset 0, no module owner, and no .cfi_jt jump-table entry), and "is @addr one
+ * of the addresses kallsyms has for @name", which covers the kernel that names that address after
+ * another symbol (code folding / vendor alias - see lsm_hook.c).  0 = "not proven", never a guess.
+ * The definitions carry __nocfi (they reach the walker through the resolver's function pointers), so
+ * the attribute is not repeated here. */
 int ksu_symbol_is_start(unsigned long addr, const char *name);
+int ksu_addr_is_named(unsigned long addr, const char *name);
 void ksu_init_symbol_resolver(void);
 
 #endif

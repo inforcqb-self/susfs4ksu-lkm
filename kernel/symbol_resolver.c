@@ -375,6 +375,66 @@ void *ksu_resolve_symbol_for_functable_hook(const char *symbol_name)
 #endif
 }
 
+/* Is @addr one of the addresses kallsyms has for @name?
+ *
+ * Asking the question address -> name (ksu_symbol_is_start() below) cannot answer this on its own,
+ * and the failure is not hypothetical: when two functions end up at the same address (identical
+ * code folded together, or a vendor alias), kallsyms_lookup() names that address after whichever
+ * symbol it lists first, which can be the OTHER one.  Measured on a 6.12.23 vendor kernel: the
+ * address SELinux registered for inode_getattr resolves to `selinux_current_getsecid_subj`, which
+ * sits at that very address - see ksu_lsm_addr_is_named() in lsm_hook.c, the same test for the
+ * >= 6.12 LSM slot scan.
+ *
+ * So the question is asked the other way round: does ANY address named @name equal this pointer?
+ * Note that the comparison is against the spelling the WALKER reports, i.e. the raw one:
+ * kallsyms_lookup() cleans what it returns (CONFIG_LTO_CLANG strips ".llvm.<hash>", and the
+ * 5.10/5.15 spelling strips everything from the last '$'), while kallsyms_on_each_symbol() hands its
+ * callback the expanded name untouched.  The two tests therefore cover each other's blind spot -
+ * ksu_symbol_is_start() asks both.
+ *
+ * Module-owned symbols are not considered (ksu_find_symbol_all() drops them, like
+ * find_kernel_symbol_exact()), and 0 is returned when nothing is known about @addr.  __nocfi because
+ * the walker is reached through a function pointer. */
+int __nocfi ksu_addr_is_named(unsigned long addr, const char *name)
+{
+    unsigned long addrs[8];
+    int n, i;
+
+    if (!addr || !name || !name[0])
+        return 0;
+
+    n = ksu_find_symbol_all(name, addrs, (int)ARRAY_SIZE(addrs));
+    /* A full list means the walker may have had more: report it, so a caller that ends up on the
+     * fallback path can tell "the name is not known" apart from "the list did not fit".  The
+     * direction is still safe - a missed match reads as "not proven", never as "proven". */
+    if (n >= (int)ARRAY_SIZE(addrs))
+        pr_warn("ksu_addr_is_named: '%s' has at least %d addresses - list truncated, a match may have been missed\n",
+                name, n);
+    for (i = 0; i < n; i++) {
+        if (addrs[i] == addr)
+            return 1;
+    }
+
+    return 0;
+}
+
+/* Is @addr the FIRST instruction of a core-kernel function called @name - i.e. is it safe to hang a
+ * kprobe on it as that function?  Two tests, because neither is complete on its own:
+ *
+ *   - address -> name through the bootstrapped kallsyms_lookup(): it returns the name of the symbol
+ *     CONTAINING @addr and, when asked for it, the offset of @addr inside that symbol.  A non-NULL
+ *     answer with modname == NULL and offset == 0 means "core-kernel symbol, and @addr is its first
+ *     instruction".  The name comes back CLEANED, so a suffix the kernel strips still matches
+ *     @name; the suffixes it does not strip are accepted through the whitelist below ('.' for
+ *     .constprop/.isra/.cold/.part, '$' for the older spelling).  A .cfi_jt name is refused: that
+ *     symbol is a CFI jump-table ENTRY (a `bti c ; b <body>` stub), not the body a kprobe has to
+ *     hang on.
+ *   - ksu_addr_is_named(), which covers the kernel that names @addr after a different symbol, and
+ *     which does not need kallsyms_lookup() to have bootstrapped (it has its own walker fallback).
+ *
+ * Non-zero means "proven to be that function's start"; 0 means "not proven", and every caller treats
+ * that as "do not probe".  A @name that cannot fit in the name buffer is refused rather than
+ * compared against it. */
 int __nocfi ksu_symbol_is_start(unsigned long addr, const char *name)
 {
     char buf[KSYM_SYMBOL_LEN];
@@ -382,14 +442,18 @@ int __nocfi ksu_symbol_is_start(unsigned long addr, const char *name)
     unsigned long offset = 0;
     size_t len;
 
-    if (!addr || !name || !name[0] || !kallsyms_lookup_fn)
+    if (!addr || !name || !name[0])
         return 0;
-    if (!kallsyms_lookup_fn(addr, NULL, &offset, &modname, buf) || modname || offset)
-        return 0;
+
     len = strlen(name);
-    if (strncmp(buf, name, len) || (buf[len] && buf[len] != '.' && buf[len] != '$'))
-        return 0;
-    return !strstr(buf + len, ".cfi_jt");
+    if (kallsyms_lookup_fn && len < sizeof(buf) &&
+        kallsyms_lookup_fn(addr, NULL, &offset, &modname, buf) && !modname && !offset &&
+        !strncmp(buf, name, len) && (!buf[len] || buf[len] == '.' || buf[len] == '$') &&
+        !strstr(buf + len, ".cfi_jt"))
+        return 1;
+
+    /* Not proven by name: ask it the other way round (see ksu_addr_is_named()). */
+    return ksu_addr_is_named(addr, name);
 }
 
 /* __nocfi like every other function here that reaches a resolved symbol: the call to
