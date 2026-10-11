@@ -20,6 +20,7 @@
 #include "susfs_log.h"
 #include "susfs.h"		/* sus_path_add_self_hidden / sus_path_del_path */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact (kallsyms_op) */
+#include "susfs_kprobe.h"	/* susfs_kp_forget_addr: a probe struct must be usable twice */
 
 /* ---- hide_modules: filter other kernel modules out of /proc/modules ----
  * /proc/modules is world-readable (0444) and lists every loaded module, so a checker that greps it sees the whole set
@@ -685,6 +686,7 @@ int susfs_hide_syms_init(void)
 	rc = register_kprobe(&kp_s_show);
 	if (rc) {
 		pr_warn("susfs_hide_syms: register_kprobe(s_show) failed %d\n", rc);
+		susfs_kp_forget_addr(&kp_s_show);
 		return rc;
 	}
 	hide_registered = true;
@@ -700,11 +702,13 @@ int susfs_hide_syms_init(void)
 
 	/* Separate probe, separate failure: hiding symbol names and hiding module entries are independent. */
 	rc = register_kprobe(&kp_m_show);
-	if (rc)
+	if (rc) {
+		susfs_kp_forget_addr(&kp_m_show);
 		pr_warn("susfs_hide_syms: register_kprobe(m_show) failed %d - /proc/modules keeps listing the modules in hide_modules\n",
 			rc);
-	else
+	} else {
 		m_show_registered = true;
+	}
 
 	/* hide_modules starts with just this module in its list: a built-in SUSFS has no module entry, so leaving ours visible
 	 * would be a trace upstream does not have.  The sysfs rule can only be registered now, because sus_path is up (this
@@ -753,10 +757,12 @@ void susfs_hide_syms_exit(void)
 	}
 	if (m_show_registered) {
 		unregister_kprobe(&kp_m_show);
+		susfs_kp_forget_addr(&kp_m_show);	/* after the call, never before: susfs_kprobe.h */
 		m_show_registered = false;
 	}
 	if (hide_registered) {
 		unregister_kprobe(&kp_s_show);
+		susfs_kp_forget_addr(&kp_s_show);
 		hide_registered = false;
 	}
 	/* The /sys/module rules are ours: drop them here, not in sus_path's teardown - this layer cleans up what it registered. */

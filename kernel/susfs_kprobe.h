@@ -3,8 +3,8 @@
  * Arming a probe a second time needs the struct handed back the way the kernel left it the
  * first time.
  *
- * register_kprobe() resolves .symbol_name only while .addr is NULL: kprobe_addr()
- * (kernel/kprobes.c) answers ERR_PTR(-EINVAL) as soon as both are set -
+ * register_kprobe() resolves .symbol_name only while .addr is NULL: kprobe_addr() ->
+ * _kprobe_addr() (kernel/kprobes.c) answers ERR_PTR(-EINVAL) as soon as both are set -
  *
  *     if ((symbol_name && addr) || (!symbol_name && !addr))
  *             goto invalid;
@@ -44,7 +44,10 @@
 
 #include <linux/kprobes.h>
 
-/* Call after unregister_kprobe()/unregister_kretprobe(), and on every registration failure. */
+/* Call AFTER unregister_kprobe()/unregister_kretprobe() returns, never before: unregister_kprobes()
+ * runs each probe's bottom half only `if (kps[i]->addr)`, so clearing the field first would skip
+ * __unregister_kprobe_bottom() and leave the probe's instruction slot behind.  Call it on every
+ * registration failure too, for the reason in the block above. */
 static inline void susfs_kp_forget_addr(struct kprobe *kp)
 {
 	kp->addr = NULL;

@@ -84,7 +84,8 @@ static int find_kernel_symbol_exact_cb(void *data, unsigned long addr)
  * called indirectly, which CFI checks; NULL is a degradation, never a load failure. */
 static __nocfi void *ksu_bootstrap_symbol(const char *name)
 {
-    struct kprobe kp;
+    struct kprobe kp;	/* stack-local and zeroed on every call, so unlike the long-lived probes in
+			 * the feature files it never carries a stale .addr - see kernel/susfs_kprobe.h */
     void *addr = NULL;
 
     memset(&kp, 0, sizeof(kp));

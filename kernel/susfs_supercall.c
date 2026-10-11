@@ -354,6 +354,9 @@ int susfs_supercall_init(void)
 
 	susfs_abi_layout_check();
 
+	/* One-shot: armed here and dropped in susfs_supercall_exit() only, so no retry can ever meet a
+	 * stale .addr.  This layer is fatal, so a failure refuses the load instead of leaving the probe
+	 * half-armed - which is why it is exempt from the reset rule in kernel/susfs_kprobe.h. */
 	rc = register_kprobe(&reboot_kp);
 	if (rc) {
 		pr_warn("susfs supercall: register_kprobe(reboot) failed %d\n", rc);
