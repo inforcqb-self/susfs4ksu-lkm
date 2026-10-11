@@ -6,19 +6,14 @@
 #include <linux/sched.h>
 #include <linux/types.h>
 
-/* KernelSU's own answer to "would I umount modules for this uid" (issue #34).  It is not exported
- * (device: `t ksu_uid_should_umount [kernelsu]`, and kernelsu.ko has no `__ksymtab`), so the loader
- * fills it from kallsyms like this module's other unexported imports.
- *
- * On a device without KernelSU there is no such symbol at all.  The loader decides that - not this
- * module - and either resolves it or pins it to 0 and passes `is_magisk=1` (see
- * kernel/ksu_umount_gate.c and tools/susfs_insmod.c); a loader that does neither leaves the name
- * SHN_UNDEF and the kernel refuses the load with "Unknown symbol", which is the wanted behaviour. */
-extern bool ksu_uid_should_umount(uid_t uid);
-
-/* Set once by ksu_umount_gate.c's init from the loader's parameter: false = ask KernelSU, true =
- * answer the pre-#34 way without ever calling the symbol above. */
+/* Set once, by ksu_umount_gate.c's init, from whether KernelSU's symbol was found: false = the gates
+ * ask KernelSU, true = answer the pre-#34 way (uid >= 10000) without calling anything.  Read by the
+ * gates, never recomputed, and never a loader parameter: the only thing that matters is one fact
+ * about the device, and it is established where the module can still see the whole picture. */
 extern bool susfs_ksu_umount_gate_off;
+
+/* Defined in ksu_umount_gate.c: the one indirect call, through the address resolved at load. */
+bool susfs_ksu_umount_ask(uid_t uid);
 
 /* Upstream's susfs_is_current_proc_umounted_app(): app uid AND KernelSU would umount for it.  The
  * uid half is upstream's literal 10000; the flag half is the predicate that flag is set from, so a
@@ -30,9 +25,9 @@ static inline bool susfs_is_current_proc_umounted_app(void)
 	if (uid < 10000)
 		return false;
 	if (READ_ONCE(susfs_ksu_umount_gate_off))
-		return true;	/* no KernelSU to ask: hide from app uids, as this module did before #34 */
+		return true;	/* nothing resolved to ask: hide from app uids, as this module did before #34 */
 
-	return ksu_uid_should_umount(uid);
+	return susfs_ksu_umount_ask(uid);
 }
 
 int susfs_ksu_umount_gate_init(void);
