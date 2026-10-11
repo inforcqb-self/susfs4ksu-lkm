@@ -142,6 +142,14 @@ void susfs_hide_syms_exit(void);
 bool susfs_hide_syms_active(void);
 bool sus_path_lsm_active(void);
 
+/* sus_path's hidden decision, for the layers that hold the inode the kernel resolved rather than a path they would have to
+ * resolve themselves (susfs_opath.c post-checks the file an open(..., O_PATH) produced).  Same question the LSM hooks ask,
+ * same answer: identity first, then (dev, i_ino), never a path string.  Not a new judgement - it is the static
+ * sus_path_inode_hidden() with a name other translation units can call, so O_PATH and the ordinary open path cannot drift
+ * apart.  NULL inode means "not hidden" (a negative dentry). */
+struct inode;
+bool sus_path_inode_hidden_public(struct inode *inode);
+
 /* Whether a 0777 /proc/susfs_* control node may be created.  Two independent conditions, neither optional: susfs_expose_proc
  * (the operator opted in) and sus_path_lsm_active() (with 0777 DAC passes every caller, so only the LSM layer can still
  * answer ENOENT for an app).  This gates node CREATION ONLY, never hook registration: an earlier revision returned early from

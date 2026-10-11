@@ -1056,6 +1056,20 @@ static bool sus_path_inode_hidden(struct inode *inode)
     return hidden;
 }
 
+/* The same decision, published for the layers that hold the inode the kernel resolved instead
+ * of a path they would have to resolve again (susfs_opath.c post-checks the file that an
+ * open(..., O_PATH) produced).  The key has to be the inode and never a path string: the
+ * caller's path was already resolved kernel-side, under that caller's own root/cwd/mount
+ * namespace and RCU walk, so re-resolving it here would be a second lookup - a rename, rmdir
+ * or mount in between points it somewhere else, which is the TOCTOU this whole layer exists to
+ * avoid - and the string is not even available without reading the caller's registers.
+ * One implementation, so the O_PATH answer cannot drift from what
+ * inode_getattr/inode_permission answer. */
+bool sus_path_inode_hidden_public(struct inode *inode)
+{
+    return sus_path_inode_hidden(inode);
+}
+
 static int sus_path_inode_getattr(const struct path *path)
 {
     struct inode *inode;

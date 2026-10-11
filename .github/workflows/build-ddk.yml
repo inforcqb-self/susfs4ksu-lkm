@@ -506,8 +506,16 @@ jobs:
           #     name: the dirent layer dispatches on the syscall NUMBER, so a missing
           #     __arm64_sys_getdents64 / __do_sys_getdents64 cannot stop it arming and the old
           #     warning text would have been false for it.
+          #
+          #     fget_raw and close_fd_get_file (susfs_opath.c) ARE listed: both are resolved by
+          #     name at runtime, so neither can appear in the .ko's undefined list and this loop
+          #     is the only place a variant's answer for them is recorded.  close_fd_get_file is
+          #     not exported at all, so a 0 here means the O_PATH layer cannot arm on that
+          #     variant.  fput is deliberately NOT here: it is EXPORT_SYMBOL'd and used as an
+          #     ordinary import, which the loader gate above and imports_guard.c already cover.
           for s in copy_mnt_ns attach_recursive_mnt generic_shutdown_super seq_show \
                    __arm64_sys_statx do_statx put_mnt_ns d_path security_cred_getsecid \
+                   fget_raw close_fd_get_file \
                    mnt_id_ida ida_alloc_range ida_free namespace_sem mnt_id_xa __xa_alloc __xa_erase \
                    kallsyms_op modules_op kallsyms_lookup_name kallsyms_lookup kallsyms_on_each_symbol \
                    kallsyms_on_each_match_symbol synchronize_rcu_tasks task_work_add \

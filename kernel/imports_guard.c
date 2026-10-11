@@ -92,6 +92,11 @@ static const struct susfs_import susfs_imports[] = {
     IMP(ihold),
     IMP(iput),
     IMP(path_put),
+    /* susfs_opath.c fputs the file it took out of the fd table; fput is EXPORT_SYMBOL'd
+     * (fs/file_table.c), so this is a link-time import like the four above and not one of the
+     * by-name lookups (its two companions fget_raw/close_fd_get_file are resolved at runtime
+     * and therefore never appear here). */
+    IMP(fput),
     IMP(task_work_add),
     IMP(__set_fixmap),
     IMP_DATA(memstart_addr),

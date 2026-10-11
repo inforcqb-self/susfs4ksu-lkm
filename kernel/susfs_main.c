@@ -13,6 +13,7 @@
 #include "ksu_umount_gate.h"
 #include "lsm_hook.h"
 #include "susfs.h"
+#include "susfs_opath.h"	/* SUSFS_OPATH_NODE + the layer's init/exit */
 
 /* The module's own name lives in susfs.h (SUSFS_LKM_MODULE_NAME / SUSFS_LKM_SYSFS_DIR):
  * /sys/module's directory and the rules that hide it (susfs_hide_syms.c) must agree, and the
@@ -45,6 +46,9 @@ static const char *const susfs_self_hide_paths[] = {
     /* sus_path's own interface (the rule listing): it goes through the same table it
      * prints, so a broken rule table is visible in the very view that reports it. */
     SUSFS_PATH_NODE,
+    /* The O_PATH layer's node: it reports the four sys_call_table/compat_sys_call_table
+     * entries and the counters that say whether a wrapper ever ran. */
+    SUSFS_OPATH_NODE,
     /* The module's own sysfs directory is NOT here: it belongs to hide_module
      * (susfs_hide_syms.c), which adds and drops that rule at runtime. */
 };
@@ -101,6 +105,12 @@ static struct {
     { "ksu_umount_gate", susfs_ksu_umount_gate_init,	NULL,			false, false },
     { "lsm_hook",	layer_lsm_hook_init,		ksu_lsm_hook_exit,	false, false },
     { "sus_path",	sus_path_init,			sus_path_exit,		true,  false },
+    /* After sus_path, because this layer asks sus_path's rule table for every open it
+     * post-checks - arming it first would install table entries that answer from a table
+     * nobody has filled in yet.  NOT fatal: a failure here only means open(..., O_PATH) keeps
+     * answering the pre-layer way (which is what the layer exists to fix, not what makes the
+     * module useful), and every entry carries its own reason in the log. */
+    { "opath",		susfs_opath_init,		susfs_opath_exit,	false, false },
     { "uname",		susfs_uname_init,		susfs_uname_exit,	false, false },
     { "kstat",		susfs_kstat_init,		susfs_kstat_exit,	false, false },
     { "sus_map",	susfs_sus_map_init,		susfs_sus_map_exit,	false, false },
