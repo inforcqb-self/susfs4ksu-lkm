@@ -509,7 +509,7 @@ jobs:
           for s in copy_mnt_ns attach_recursive_mnt generic_shutdown_super seq_show \
                    __arm64_sys_statx do_statx put_mnt_ns d_path security_cred_getsecid \
                    mnt_id_ida ida_alloc_range ida_free namespace_sem mnt_id_xa __xa_alloc __xa_erase \
-                   kallsyms_op kallsyms_lookup_name kallsyms_lookup kallsyms_on_each_symbol \
+                   kallsyms_op modules_op kallsyms_lookup_name kallsyms_lookup kallsyms_on_each_symbol \
                    kallsyms_on_each_match_symbol synchronize_rcu_tasks task_work_add \
                    saved_boot_config init_mm copy_to_kernel_nofault __set_fixmap \
                    security_hook_heads static_calls_table lsm_active_cnt __static_call_update \

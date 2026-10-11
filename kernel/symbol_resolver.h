@@ -14,6 +14,7 @@ int ksu_find_symbol_all(const char *name, unsigned long *addrs, int max);
  * does not sleep, so it is usable from atomic context. */
 unsigned long ksu_kallsyms_lookup_name(const char *name);
 int ksu_symbol_name_of(unsigned long addr, char *buf, char **module_out);
+int ksu_symbol_is_start(unsigned long addr, const char *name);
 void ksu_init_symbol_resolver(void);
 
 #endif

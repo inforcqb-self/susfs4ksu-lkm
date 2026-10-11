@@ -375,6 +375,23 @@ void *ksu_resolve_symbol_for_functable_hook(const char *symbol_name)
 #endif
 }
 
+int __nocfi ksu_symbol_is_start(unsigned long addr, const char *name)
+{
+    char buf[KSYM_SYMBOL_LEN];
+    char *modname = NULL;
+    unsigned long offset = 0;
+    size_t len;
+
+    if (!addr || !name || !name[0] || !kallsyms_lookup_fn)
+        return 0;
+    if (!kallsyms_lookup_fn(addr, NULL, &offset, &modname, buf) || modname || offset)
+        return 0;
+    len = strlen(name);
+    if (strncmp(buf, name, len) || (buf[len] && buf[len] != '.' && buf[len] != '$'))
+        return 0;
+    return !strstr(buf + len, ".cfi_jt");
+}
+
 /* __nocfi like every other function here that reaches a resolved symbol: the call to
  * kallsyms_lookup() goes through a function pointer, so an instrumented call site would be
  * checked against the kernel's type id - and that check panics when it does not match.

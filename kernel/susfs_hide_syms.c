@@ -15,6 +15,7 @@
 #include <linux/string.h>
 #include <linux/proc_fs.h>	/* the runtime control node */
 #include <linux/cred.h>		/* current_uid() */
+#include <linux/uaccess.h>
 #include <linux/slab.h>		/* kvmalloc()/kvfree() on 6.1+ */
 #include <linux/mm.h>		/* kvmalloc()/kvfree() on 5.10-5.15 */
 #include "susfs_log.h"
@@ -550,13 +551,12 @@ static bool name_should_hide(const char *name)
 static atomic_t hide_hit_count = ATOMIC_INIT(0);
 static atomic_t hide_enter_count = ATOMIC_INIT(0);
 static atomic_t hide_layout_bad = ATOMIC_INIT(0);
+static const struct seq_operations *kallsyms_op_target;
+static const struct seq_operations *modules_op_target;
 
 /* Is this really a kernel struct kallsym_iter?  Two facts are always true of one: kallsyms
- * fills `type` from its own alphabet, and `name` is NUL-terminated within the field.  The check
- * exists because this kprobe is registered BY NAME and `s_show` is not unique in a kernel that
- * has kernel/kallsyms.c's and kernel/trace/trace.c's (and mm/vmalloc.c's); if it lands on the
- * wrong one, m->private is some other object and walking it with strncmp and strstr reads
- * whatever is there.  With this gate the string walk below is bounded either way, and a
+ * fills `type` from its own alphabet, and `name` is NUL-terminated within the field.
+ * With this gate the string walk below is bounded either way, and a
  * mismatch is counted and reported instead of silently mis-hiding. */
 static bool hide_syms_iter_plausible(const struct kallsym_iter_local *it)
 {
@@ -575,7 +575,7 @@ static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
 	struct kallsym_iter_local *iter;
 
 	atomic_inc(&hide_enter_count);
-	if (!m || !m->private)
+	if (!m || m->op != kallsyms_op_target || !m->private)
 		return 0;
 	iter = (struct kallsym_iter_local *)m->private;
 	if (!hide_syms_iter_plausible(iter)) {
@@ -604,15 +604,13 @@ static int hide_syms_s_show_pre(struct kprobe *kp, struct pt_regs *regs)
 	return 0;
 }
 
-/* Registered by name, which is what was measured to work: with this in place `grep -cE 'susfs_|ksu_' /proc/kallsyms` goes 257
- * -> 0.  An audit pointed out that this tree has three different `s_show` functions (kernel/kallsyms.c, kernel/trace/trace.c,
- * mm/vmalloc.c) and that name-based registration gets whichever kallsyms lists first - a real hazard, since the handler reads
- * m->private as struct kallsym_iter *.  Taking the address out of the kallsyms_op table instead and registering with .addr
- * CRASHED the device on the first read of /proc/kallsyms, so the table's .show is not the address a kprobe can be hung on
- * (most likely the arm64 CFI jump-table thunk, which a table's function pointer holds under this config).  So: keep the
- * working registration, and log both addresses so a mismatch is visible. */
+/* The former name-based registration was measured to filter kallsyms on one device, but an
+ * audit found three different `s_show` functions (kernel/kallsyms.c, kernel/trace/trace.c,
+ * mm/vmalloc.c), so its success did not establish that the same name selects the right callback
+ * on another kernel.  A previous raw kallsyms_op.show address probe crashed on the first read
+ * of /proc/kallsyms.  The cause of that crash was not established; the callback's function body
+ * must be validated rather than assuming that every mismatch is a CFI jump-table thunk. */
 static struct kprobe kp_s_show = {
-	.symbol_name = "s_show",
 	.pre_handler = hide_syms_s_show_pre,
 };
 
@@ -621,10 +619,11 @@ static struct kprobe kp_s_show = {
  * would be without the module.  struct module's layout is what this module was built against (RANDSTRUCT is off here). */
 static int hide_syms_m_show_pre(struct kprobe *kp, struct pt_regs *regs)
 {
+	struct seq_file *m = (struct seq_file *)regs_get_kernel_argument(regs, 0);
 	struct module *mod;
 	void *p = (void *)regs_get_kernel_argument(regs, 1);
 
-	if (!p)
+	if (!m || m->op != modules_op_target || !p)
 		return 0;
 
 	/* Same recovery the kernel's own m_show() does: the iterator hands over &module->list, so the module is one offset away. */
@@ -639,22 +638,51 @@ static int hide_syms_m_show_pre(struct kprobe *kp, struct pt_regs *regs)
 }
 
 static struct kprobe kp_m_show = {
-	.symbol_name = "m_show",
 	.pre_handler = hide_syms_m_show_pre,
 };
 
 static bool m_show_registered;
 
-/* Read-only comparison target: the function kallsyms itself calls. */
-static unsigned long hide_syms_table_show(void)
+static int __nocfi noinline hide_syms_resolve_show(struct kprobe *kp,
+		const char *table_name, const char *symbol_name,
+		const struct seq_operations **table_out)
 {
 	const struct seq_operations *op;
-	unsigned long addr = find_kernel_symbol_exact("kallsyms_op");
+	unsigned long addr = find_kernel_symbol_exact(table_name);
+	unsigned long show, target;
+#if defined(CONFIG_CFI_CLANG) && LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
+	u32 insn;
+	unsigned long branch;
+#endif
 
+	*table_out = NULL;
 	if (!addr)
-		return 0;
+		return -ENOENT;
 	op = (const struct seq_operations *)addr;
-	return (unsigned long)op->show;
+	if (copy_from_kernel_nofault(&show, &op->show, sizeof(show)))
+		return -EFAULT;
+	if (!show || (show & 3))
+		return -EINVAL;
+	target = show;
+#if defined(CONFIG_CFI_CLANG) && LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
+	branch = show;
+	if (copy_from_kernel_nofault(&insn, (void *)branch, sizeof(insn)))
+		return -EFAULT;
+	if (insn == 0xd503245f) {
+		branch += sizeof(insn);
+		if (copy_from_kernel_nofault(&insn, (void *)branch, sizeof(insn)))
+			return -EFAULT;
+	}
+	if ((insn & 0xfc000000) == 0x14000000)
+		target = branch + (long)((s32)(insn << 6) >> 4);
+#endif
+	if (!target || (target & 3) || !ksu_symbol_is_start(target, symbol_name))
+		return -EINVAL;
+	kp->addr = (kprobe_opcode_t *)target;
+	*table_out = op;
+	SUSFS_LOGI("susfs_hide_syms: %s.show=%px, probe body=%px\n",
+			table_name, (void *)show, (void *)target);
+	return 0;
 }
 
 static bool hide_registered;
@@ -662,7 +690,6 @@ static bool hide_registered;
 int susfs_hide_syms_init(void)
 {
 	int rc;
-	unsigned long table_show;
 
 	/* Apply what the insmod parameter cached (see hide_modules_pending_val) FIRST, and before the
 	 * kprobe registrations below: those can fail without failing the load (this layer is non-fatal in
@@ -683,31 +710,33 @@ int susfs_hide_syms_init(void)
 		mutex_unlock(&hide_syms_param_lock);
 	}
 
-	rc = register_kprobe(&kp_s_show);
+	rc = hide_syms_resolve_show(&kp_s_show, "kallsyms_op", "s_show",
+			&kallsyms_op_target);
+	if (!rc)
+		rc = register_kprobe(&kp_s_show);
 	if (rc) {
-		pr_warn("susfs_hide_syms: register_kprobe(s_show) failed %d\n", rc);
+		pr_warn("susfs_hide_syms: cannot arm kallsyms s_show: %d\n", rc);
 		susfs_kp_forget_addr(&kp_s_show);
 		return rc;
 	}
 	hide_registered = true;
 
-	table_show = hide_syms_table_show();
-	/* The two addresses differ by design: a function pointer inside a table holds the CFI jump-table thunk
-	 * (bti c ; b func), while the kprobe lands on the function itself.  The check that matters is the one on device -
-	 * /proc/kallsyms going from 257 ksu_/susfs_ matches to none - and that is what the line is for. */
-	SUSFS_LOGI("susfs_hide_syms: armed at %px (kallsyms_op.show=%px%s)\n",
-		(void *)kp_s_show.addr, (void *)table_show,
-		(table_show && (unsigned long)kp_s_show.addr == table_show) ?
-		" - same address" : " - different address (expected: table holds the CFI thunk)");
+	SUSFS_LOGI("susfs_hide_syms: s_show armed at %px (kallsyms_op=%px)\n",
+			(void *)kp_s_show.addr, kallsyms_op_target);
 
 	/* Separate probe, separate failure: hiding symbol names and hiding module entries are independent. */
-	rc = register_kprobe(&kp_m_show);
+	rc = hide_syms_resolve_show(&kp_m_show, "modules_op", "m_show",
+			&modules_op_target);
+	if (!rc)
+		rc = register_kprobe(&kp_m_show);
 	if (rc) {
 		susfs_kp_forget_addr(&kp_m_show);
-		pr_warn("susfs_hide_syms: register_kprobe(m_show) failed %d - /proc/modules keeps listing the modules in hide_modules\n",
+		pr_warn("susfs_hide_syms: cannot arm modules m_show: %d - /proc/modules keeps listing the modules in hide_modules\n",
 			rc);
 	} else {
 		m_show_registered = true;
+		SUSFS_LOGI("susfs_hide_syms: m_show armed at %px (modules_op=%px)\n",
+				(void *)kp_m_show.addr, modules_op_target);
 	}
 
 	/* hide_modules starts with just this module in its list: a built-in SUSFS has no module entry, so leaving ours visible
@@ -765,6 +794,8 @@ void susfs_hide_syms_exit(void)
 		susfs_kp_forget_addr(&kp_s_show);
 		hide_registered = false;
 	}
+	modules_op_target = NULL;
+	kallsyms_op_target = NULL;
 	/* The /sys/module rules are ours: drop them here, not in sus_path's teardown - this layer cleans up what it registered. */
 	hide_modules_commit(hide_modules_applied, 0);
 	hide_modules_sync_sysfs();
