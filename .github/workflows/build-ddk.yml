@@ -10,6 +10,18 @@ on:
       - legacy
     paths-ignore:
       - "**.md"
+  # Pull requests build the same way, which is what a fork contribution needs: the first fork PR this
+  # repository took arrived with a header comment that broke all six variants, and nothing here could
+  # see it until the branch had been pulled in by hand.  This is safe to enable because GitHub runs the
+  # BASE branch's copy of the workflow for pull_request events (a fork cannot change what executes),
+  # no secret is referenced anywhere in this file, and the privileged container is discarded after the
+  # run.  main and dev only: legacy has no DDK image, and 6.12/6.18 live on dev.
+  pull_request:
+    branches:
+      - main
+      - dev
+    paths-ignore:
+      - "**.md"
   workflow_dispatch:
 
 jobs:
