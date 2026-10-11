@@ -55,6 +55,12 @@
 #include <linux/seq_file.h>
 #include <linux/fcntl.h>	/* O_PATH, for the wrapper's flags fast path */
 #include <asm/unistd.h>		/* __NR_openat, __NR_openat2, __NR_syscalls */
+#include <asm/ptrace.h>		/* struct pt_regs: the wrappers read the caller's argument
+				 * registers.  Written out because nothing else here reaches it -
+				 * susfs_fp_hook.h only forward-declares the struct, and none of
+				 * <linux/fs.h>/<linux/cred.h>/<linux/mm.h> pulls asm/ptrace.h in
+				 * (the kprobe layers get it through <linux/kprobes.h>, sus_path.c
+				 * through <asm/syscall.h>). */
 
 #include "symbol_resolver.h"
 #include "susfs_log.h"

@@ -60,13 +60,11 @@ static susfs_syscall_fn_t *compat_sys_call_table_ptr;
 #define SUSFS_FP_COMPAT_MAX_NR	__NR_syscalls
 #endif
 
-/* The compat index of a hook, -1 when it has no compat entry.  0 in nr_compat means "the same
- * number as nr" (see struct susfs_fp_hook) - which is only reachable when nr >= 0. */
+/* The compat index of a hook, -1 when it has no 32-bit entry (nr_compat 0).  A negative value
+ * is not a valid index and is refused by the caller, so it never reaches the table. */
 static int fp_compat_nr(const struct susfs_fp_hook *h)
 {
-	if (!h->compat)
-		return -1;
-	return h->nr_compat ? h->nr_compat : h->nr;
+	return h->nr_compat ? h->nr_compat : -1;
 }
 
 /* One table patch, with the same ordering rule for both tables: the wrapper reads
@@ -126,8 +124,8 @@ int susfs_fp_init(void)
 	pr_info("susfs_fp: sys_call_table at %px (entry 0 %px)\n",
 		sys_call_table_ptr, (void *)READ_ONCE(sys_call_table_ptr[0]));
 
-	/* Optional: only the entries marked .compat need it, and a kernel without it
-	 * just means those entries stay native-only. */
+	/* Optional: only the hooks with a compat index (nr_compat) need it, and a kernel without
+	 * the table just means those hooks stay native-only or cannot arm at all. */
 	compat_sys_call_table_ptr =
 		(susfs_syscall_fn_t *)find_kernel_symbol_exact("compat_sys_call_table");
 	if (!compat_sys_call_table_ptr)
@@ -212,11 +210,13 @@ int susfs_fp_install(struct susfs_fp_hook *h)
 		pr_warn("susfs_fp: %s: bogus nr %d\n", h->name, h->nr);
 		return -EINVAL;
 	}
-	cnr = fp_compat_nr(h);
-	if (cnr >= SUSFS_FP_COMPAT_MAX_NR) {
-		pr_warn("susfs_fp: %s: bogus compat nr %d\n", h->name, cnr);
+	/* The compat number has its own bound, and a negative one is refused here rather than
+	 * treated as "none": only nr_compat == 0 means "this hook has no 32-bit entry". */
+	if (h->nr_compat < 0 || h->nr_compat >= SUSFS_FP_COMPAT_MAX_NR) {
+		pr_warn("susfs_fp: %s: bogus compat nr %d\n", h->name, h->nr_compat);
 		return -EINVAL;
 	}
+	cnr = fp_compat_nr(h);
 	if (h->nr < 0 && cnr < 0) {
 		pr_warn("susfs_fp: %s: no native entry and no compat entry\n", h->name);
 		return -EINVAL;
