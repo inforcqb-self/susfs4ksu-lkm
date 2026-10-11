@@ -278,7 +278,13 @@ static void sus_path_maybe_drop_caller_cred(void)
     /* Re-checked under the lock: sus_path_save_caller_cred() takes this same lock, so an add that
      * registered a pending rule in between has stored its own cred by the time this section runs.
      * Dropping it there would send the resolver back to walking with the worker's creds - measured
-     * to come back -EACCES under /data, which is why the caller's creds are saved at all. */
+     * to come back -EACCES under /data, which is why the caller's creds are saved at all.
+     *
+     * One window stays open and heals itself: the list_add and the pending increment happen under
+     * sus_path_lock, while sus_path_save_caller_cred() runs after it, so for a few instructions a
+     * pending rule can exist without creds.  A retry pass that lands exactly there walks once with
+     * the worker's creds (-EACCES, recorded in pend_last_rc), and the next pass one
+     * SUS_PATH_PENDING_RETRY_S later has them; the rule stays pending throughout. */
     mutex_lock(&sus_path_cred_lock);
     if (!atomic_read(&sus_path_n_pending)) {
         old = sus_path_pending_cred;
@@ -377,11 +383,14 @@ static bool sus_path_is_hidden(u64 ino, const char *name)
      * cannot tell one filesystem from another.  The two layers therefore disagree about one object
      * in a narrow case: a same-named entry that reuses the same d_ino on ANOTHER filesystem is
      * dropped from the listing - the rule's dev is not consulted - while its stat/open still work,
-     * because the LSM layer rejects that (dev, i_ino) pair.  The direction is the safe one: a
-     * listing that hides more than the file layer does never leaks a registered name, and the
-     * alternative (matching the name alone) would hide unrelated entries.  A rule whose inode
-     * reports 0 has no identity to match, and d_ino 0 is what some filesystems use for "unknown",
-     * so such a rule is hidden by the by-inode layers only (sus_path_supercall()). */
+     * because the LSM layer rejects that (dev, i_ino) pair.  The collision is not exotic - most
+     * filesystems number inodes from low values, so a common basename is enough - but the direction
+     * is the safe one: a listing that hides more than the file layer does never leaks a registered
+     * name.  The alternative is not free either: matching the name alone would hide unrelated
+     * entries, which is exactly why the only name-only mode in this file is the explicit opt-in
+     * debug parameter hide_name.  A rule whose inode reports 0 has no identity to match, and
+     * d_ino 0 is what some filesystems use for "unknown", so such a rule is hidden by the
+     * by-inode layers only (sus_path_supercall()). */
     if (ino) {
         spin_lock(&sus_path_lock);
         list_for_each_entry(e, &sus_path_list, list) {
@@ -2344,7 +2353,10 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
                  * timer that ran out its SUS_PATH_PENDING_TRIES: without the re-arm this add
                  * reports success and nothing ever tries the walk again, although the comment
                  * above the loop has always said "the next add re-arms the timer".  `inode` is
-                 * NULL exactly in that case (the other arm of the condition needs it non-NULL). */
+                 * NULL exactly in that case (the other arm of the condition needs it non-NULL).
+                 * The arm's immediate pass re-walks the path this add just failed on - wasted -
+                 * but it also re-tries every other pending rule, which may have become reachable
+                 * since the timer stopped. */
                 spin_unlock(&sus_path_lock);
                 if (e->inode)
                     iput(e->inode);
