@@ -107,6 +107,10 @@ static inline bool opath_has_landing_pad(const void *fn)
  * instead (the counters and the log say which name was missing). */
 static struct file *(*opath_fget_raw)(unsigned int fd);
 static int (*opath_close_fd_get_file)(unsigned int fd, struct file **res);
+/* Which of the two names the kernel above answered to (see susfs_opath_init): only the log
+ * needs it, and a log that prints a pointer without the name it came from cannot tell
+ * close_fd_get_file from file_close_fd on a kernel where one of them is missing. */
+static const char *opath_close_fd_name = "close_fd_get_file";
 
 /* What the layer did, not what it is configured to do: a wrapper that never runs and one that
  * runs and matches nothing look identical from the outside, and only these separate them. */
@@ -437,13 +441,29 @@ int susfs_opath_init(void)
 	}
 
 	opath_fget_raw = (void *)find_kernel_symbol_exact("fget_raw");
+
+	/* One function, two names: 6.11 reworked the fd-table internals, so what 5.15 calls
+	 * close_fd_get_file() (fs/file.c:795-805) is file_close_fd() from 6.12 on
+	 * (fs/file.c:784-791) - the same "take the fd out of the table, hand the caller the file,
+	 * it fputs it" contract, with the locking still inside.  This is not a cosmetic rename for
+	 * us: the CI's by-name step measures close_fd_get_file as 1 on 5.10/5.15/6.1/6.6 and 0 on
+	 * 6.12/6.18, and that 0 is this layer refusing to install on those kernels. */
 	opath_close_fd_get_file = (void *)find_kernel_symbol_exact("close_fd_get_file");
+	opath_close_fd_name = "close_fd_get_file";
+	if (!opath_close_fd_get_file) {
+		opath_close_fd_get_file = (void *)find_kernel_symbol_exact("file_close_fd");
+		opath_close_fd_name = "file_close_fd";
+	}
+
 	if (!opath_fget_raw || !opath_close_fd_get_file) {
 		/* Refusing to install beats installing a wrapper that cannot finish: without
 		 * these two the post-check could not take a descriptor away, so the layer
-		 * would only have added a fault path to every open on the system. */
-		pr_warn("opath: fget_raw=%px close_fd_get_file=%px - a name was not resolved, no table entry is installed and O_PATH stays visible\n",
-			(void *)opath_fget_raw, (void *)opath_close_fd_get_file);
+		 * would only have added a fault path to every open on the system.  Both names
+		 * are printed, because "the name is missing" is only useful with which one. */
+		pr_warn("opath: fget_raw=%px close_fd_get_file=%px file_close_fd=%px - a name was not resolved, no table entry is installed and O_PATH stays visible\n",
+			(void *)opath_fget_raw,
+			(void *)find_kernel_symbol_exact("close_fd_get_file"),
+			(void *)find_kernel_symbol_exact("file_close_fd"));
 		atomic_inc(&n_opath_err);
 		return -ENOENT;
 	}
@@ -510,9 +530,10 @@ int susfs_opath_init(void)
 			(int)susfs_expose_proc, (int)sus_path_lsm_active());
 	}
 
-	SUSFS_LOGI("opath armed: %d/%d entries, proc=%d, fget_raw=%px close_fd_get_file=%px\n",
+	SUSFS_LOGI("opath armed: %d/%d entries, proc=%d, fget_raw=%px %s=%px\n",
 		armed, attempted, opath_proc_entry != NULL,
-		(void *)opath_fget_raw, (void *)opath_close_fd_get_file);
+		(void *)opath_fget_raw, opath_close_fd_name,
+		(void *)opath_close_fd_get_file);
 	return 0;
 }
 

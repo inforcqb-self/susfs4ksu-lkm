@@ -513,9 +513,20 @@ jobs:
           #     not exported at all, so a 0 here means the O_PATH layer cannot arm on that
           #     variant.  fput is deliberately NOT here: it is EXPORT_SYMBOL'd and used as an
           #     ordinary import, which the loader gate above and imports_guard.c already cover.
+          #
+          #     file_close_fd is the same function under its 6.11+ name: what 5.15 calls
+          #     close_fd_get_file() (fs/file.c:795-805) is file_close_fd() from 6.12 on
+          #     (fs/file.c:784-791), with the same contract.  The module resolves whichever name
+          #     the kernel has, so both are listed - and the counts are where that rename became
+          #     visible (close_fd_get_file: 1 on 5.10/5.15/6.1/6.6, 0 on 6.12/6.18).
+          #     The two syscall tables are listed for the same reason: susfs_fp_hook resolves them
+          #     by name, and a 0 for either is what would stop every table-entry layer at once
+          #     (the tables themselves obviously exist - this is about the symbol being in
+          #     System.map, i.e. reachable by kallsyms).
           for s in copy_mnt_ns attach_recursive_mnt generic_shutdown_super seq_show \
                    __arm64_sys_statx do_statx put_mnt_ns d_path security_cred_getsecid \
-                   fget_raw close_fd_get_file \
+                   fget_raw close_fd_get_file file_close_fd \
+                   sys_call_table compat_sys_call_table \
                    mnt_id_ida ida_alloc_range ida_free namespace_sem mnt_id_xa __xa_alloc __xa_erase \
                    kallsyms_op modules_op kallsyms_lookup_name kallsyms_lookup kallsyms_on_each_symbol \
                    kallsyms_on_each_match_symbol synchronize_rcu_tasks task_work_add \
