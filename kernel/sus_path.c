@@ -7,8 +7,9 @@
  * fs/namei.c (link_path_walk returns -ENOENT; __lookup_slow/lookup_open redo the
  * lookup with the fake qstr "..5.u.S").  This LKM can touch neither - filldir64 is
  * static and LTO-inlined, namei.c is compiled into the kernel - so it reproduces
- * both effects: the getdents64 buffer is rewritten on return (layer 1, by (dev,
- * ino)), and two LSM hooks answer registered inodes with -ENOENT (layer 2:
+ * both effects: the getdents64 buffer is rewritten on return (layer 1, by (ino,
+ * name) - a dirent record carries no dev, see sus_path_is_hidden()), and two LSM
+ * hooks answer registered inodes with -ENOENT (layer 2:
  * inode_getattr for stat/fstatat/statx, inode_permission for
  * open/exec/chmod/truncate/...).
  *
@@ -198,8 +199,9 @@ static inline bool sus_path_is_resolver(void)
  * kern_path("/data/local/tmp/...") comes back -EACCES and the rule stays pending forever
  * (pend: last-rc=-13).  ksu_cred lives in the `kernelsu` module and
  * find_kernel_symbol_exact() deliberately refuses module symbols ("ignore symbol ... of module
- * ..."), so the creds of whoever registered the rule are saved instead - one reference, released on
- * unload - and that process can by definition reach the path. */
+ * ..."), so the creds of whoever registered the rule are saved instead - one reference, released
+ * as soon as the last pending rule is gone (sus_path_maybe_drop_caller_cred()) or on unload - and
+ * that process can by definition reach the path. */
 static const struct cred *sus_path_pending_cred;
 static DEFINE_MUTEX(sus_path_cred_lock);
 static atomic_t sus_path_used_caller_cred = ATOMIC_INIT(0);
@@ -256,6 +258,32 @@ static void sus_path_drop_caller_cred(void)
     mutex_lock(&sus_path_cred_lock);
     old = sus_path_pending_cred;
     sus_path_pending_cred = NULL;
+    mutex_unlock(&sus_path_cred_lock);
+    if (old)
+        put_cred(old);
+}
+
+/* The saved creds are only needed while a rule is still waiting for its walk.  Release them as
+ * soon as the last pending rule is gone - resolved, deleted or cleared - instead of holding one
+ * reference (and with it the registering task's user_ns/ucounts) until the module is unloaded.
+ * A rule that is STILL pending keeps them, because the next retry (or the next add that re-arms
+ * the timer) needs them. */
+static void sus_path_maybe_drop_caller_cred(void)
+{
+    const struct cred *old = NULL;
+
+    if (atomic_read(&sus_path_n_pending))
+        return;
+
+    /* Re-checked under the lock: sus_path_save_caller_cred() takes this same lock, so an add that
+     * registered a pending rule in between has stored its own cred by the time this section runs.
+     * Dropping it there would send the resolver back to walking with the worker's creds - measured
+     * to come back -EACCES under /data, which is why the caller's creds are saved at all. */
+    mutex_lock(&sus_path_cred_lock);
+    if (!atomic_read(&sus_path_n_pending)) {
+        old = sus_path_pending_cred;
+        sus_path_pending_cred = NULL;
+    }
     mutex_unlock(&sus_path_cred_lock);
     if (old)
         put_cred(old);
@@ -345,9 +373,15 @@ static bool sus_path_is_hidden(u64 ino, const char *name)
         return false;
 
     /* A dirent is identified by (d_ino, name) and nothing else here - the filter never sees the fd
-     * or the superblock.  A rule whose inode reports 0 has no identity to match, and d_ino 0 is
-     * what some filesystems use for "unknown", so matching it by name alone would hide unrelated
-     * entries; such a rule is hidden by the by-inode layers only (sus_path_supercall()). */
+     * or the superblock, so unlike the LSM layer (the ihold'ed inode pointer, then (dev, i_ino)) it
+     * cannot tell one filesystem from another.  The two layers therefore disagree about one object
+     * in a narrow case: a same-named entry that reuses the same d_ino on ANOTHER filesystem is
+     * dropped from the listing - the rule's dev is not consulted - while its stat/open still work,
+     * because the LSM layer rejects that (dev, i_ino) pair.  The direction is the safe one: a
+     * listing that hides more than the file layer does never leaks a registered name, and the
+     * alternative (matching the name alone) would hide unrelated entries.  A rule whose inode
+     * reports 0 has no identity to match, and d_ino 0 is what some filesystems use for "unknown",
+     * so such a rule is hidden by the by-inode layers only (sus_path_supercall()). */
     if (ino) {
         spin_lock(&sus_path_lock);
         list_for_each_entry(e, &sus_path_list, list) {
@@ -513,6 +547,10 @@ static int sus_path_resolve_pending(void)
                 resolved, atomic_read(&sus_path_n_pending));
 
     mutex_unlock(&sus_path_pending_lock);
+
+    /* This pass may have resolved the last pending rule, and nothing else will need the
+     * registering process' creds once none is left. */
+    sus_path_maybe_drop_caller_cred();
     return resolved;
 }
 
@@ -1457,6 +1495,9 @@ int sus_path_del_path(const char *path)
     if (removed)
         SUSFS_LOGI("sus_path: removed %d rule(s) for %s, %d left\n", removed, want,
                 sus_path_count);
+    /* A deleted rule cannot resolve later: if it was the last pending one, its caller's creds are
+     * not needed any more. */
+    sus_path_maybe_drop_caller_cred();
     return removed;
 }
 
@@ -1558,6 +1599,9 @@ static int sus_path_command(const char *val, int *removed_out)
             iput(e->inode);
         kfree(e);
     }
+    /* Whatever was removed above is gone for good, `clear` included: if the last pending rule went
+     * with it, the registering process' creds are not needed any more either. */
+    sus_path_maybe_drop_caller_cred();
     SUSFS_LOGI("sus_path: command written, %d rule(s) removed, %d left\n",
             removed, sus_path_count);
     if (removed_out)
@@ -2293,14 +2337,21 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
 
         list_for_each_entry(cur, &sus_path_list, list) {
             /* Same inode: upstream's set_bit() is idempotent.  Same still-unresolved path:
-             * nothing to add but the retry marker. */
+             * nothing to add but the retry marker, which is re-armed below. */
             if ((inode && cur->inode == inode) ||
                 (!inode && !cur->inode && !strcmp(cur->path, e->path))) {
+                /* A duplicate of a rule that is STILL pending is the documented way back from a
+                 * timer that ran out its SUS_PATH_PENDING_TRIES: without the re-arm this add
+                 * reports success and nothing ever tries the walk again, although the comment
+                 * above the loop has always said "the next add re-arms the timer".  `inode` is
+                 * NULL exactly in that case (the other arm of the condition needs it non-NULL). */
                 spin_unlock(&sus_path_lock);
                 if (e->inode)
                     iput(e->inode);
                 kfree(e);
                 info.err = 0;   /* already registered, upstream is idempotent */
+                if (!inode)
+                    sus_path_pending_arm();
                 goto out;
             }
             /* The rule is there as a pending one and this add is what resolved it: complete that
@@ -2372,6 +2423,11 @@ void sus_path_supercall(unsigned int cmd, void __user **arg)
 
     info.err = 0;
 out:
+    /* Every exit above can be the one that took the pending count to zero (a duplicate add that
+     * completed a pending rule, a failed add, a del/clear), and once none is left the resolver
+     * does not need the registering process' creds any more.  Idempotent, so the explicit calls
+     * in del/clear/resolve are harmless. */
+    sus_path_maybe_drop_caller_cred();
     /* upstream writes back only ->err for input-type commands */
     if (copy_to_user(&((struct st_susfs_sus_path __user *)*arg)->err,
                      &info.err, sizeof(info.err)))
