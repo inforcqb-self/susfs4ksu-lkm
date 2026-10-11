@@ -901,13 +901,17 @@ static bool susfs_kstat_spoof_compat_statbuf(struct kstat_call_state *st, unsign
 #define STATX_F_BLOCKS		STATX_BLOCKS
 
 struct susfs_statx_offs {
-	unsigned short dev, ino, nlink, size, blksize, blocks;
+	unsigned short dev, dev_minor, ino, nlink, size, blksize, blocks;
 	unsigned short atime_sec, atime_nsec, mtime_sec, mtime_nsec,
 		       ctime_sec, ctime_nsec, mask;
 };
 
 static const struct susfs_statx_offs kstat_statx_offs = {
 	.dev = offsetof(struct statx, stx_dev_major),
+	/* statx is the one family that hands out the two device halves separately; the table
+	 * stores the encoded value st_dev carries, so the lookup key has to be rebuilt from
+	 * both halves before the lookup below. */
+	.dev_minor = offsetof(struct statx, stx_dev_minor),
 	.ino = offsetof(struct statx, stx_ino),
 	.nlink = offsetof(struct statx, stx_nlink),
 	.size = offsetof(struct statx, stx_size),
@@ -994,6 +998,7 @@ static bool susfs_kstat_spoof_statx(struct kstat_call_state *st, unsigned long s
 	const struct sus_kstat_snapshot *e = &snap;
 	unsigned long ino = 0;
 	unsigned int dev = 0;
+	u32 dev_major = 0, dev_minor = 0;
 	u32 buf_mask = 0, eff;
 	bool rewrote = false;
 
@@ -1010,10 +1015,19 @@ static bool susfs_kstat_spoof_statx(struct kstat_call_state *st, unsigned long s
 		atomic_inc(&st->cnt->uaccess);
 		return false;
 	}
-	if (copy_from_user(&dev, (void __user *)(sbuf + o->dev), sizeof(dev))) {
+	/* statx reports the device as two halves, while the table stores the ENCODED value the
+	 * other stat families put in st_dev (sus_kstat_entry.dev): read both halves and encode
+	 * them the same way, or the lookup key can never match and the whole statx spoof is dead.
+	 * (Reading only stx_dev_major here is exactly that bug.) */
+	if (copy_from_user(&dev_major, (void __user *)(sbuf + o->dev), sizeof(dev_major))) {
 		atomic_inc(&st->cnt->uaccess);
 		return false;
 	}
+	if (copy_from_user(&dev_minor, (void __user *)(sbuf + o->dev_minor), sizeof(dev_minor))) {
+		atomic_inc(&st->cnt->uaccess);
+		return false;
+	}
+	dev = new_encode_dev(MKDEV(dev_major, dev_minor));
 	if (copy_from_user(&buf_mask, (void __user *)(sbuf + o->mask), sizeof(buf_mask))) {
 		atomic_inc(&st->cnt->uaccess);
 		return false;
@@ -1067,7 +1081,7 @@ static bool susfs_kstat_spoof_statx(struct kstat_call_state *st, unsigned long s
 			atomic_inc(&st->cnt->uaccess);
 			return false;
 		}
-		if (copy_to_user((void __user *)(sbuf + o->dev + 4), &min, sizeof(min))) {
+		if (copy_to_user((void __user *)(sbuf + o->dev_minor), &min, sizeof(min))) {
 			atomic_inc(&st->cnt->uaccess);
 			return false;
 		}
