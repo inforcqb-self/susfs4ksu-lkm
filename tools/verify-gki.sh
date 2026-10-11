@@ -153,6 +153,16 @@ echo "  --- what the kernel said ---"
 dmesg | grep -E 'Unknown symbol|does not import it|version magic|CFI failure|BUG:|Oops|not syncing' | tail -10 | sed 's/^/  /'
 [ "$(dmesg | grep -c 'Unknown symbol')" = "0" ] && ok "no 'Unknown symbol' lines" || bad "kernel reported unknown symbols"
 [ "$(dmesg | grep -c 'CFI failure')" = "0" ] && ok "no CFI failure line" || bad "CFI failure reported"
+# The hide gates settle once, at load, whether KernelSU's predicate can be asked, and say which way
+# they went.  Neither line means that layer never ran at all - fail_layer=1 skips it, and the module
+# then keeps the pre-#34 rule by design, so that is a note rather than a failure.
+if dmesg | grep -q 'ksu_umount_gate: resolved ksu_uid_should_umount at'; then
+    ok "gate: KernelSU's predicate resolved - issue #34's rule is in effect"
+elif dmesg | grep -q 'ksu_uid_should_umount is not in kallsyms'; then
+    note "gate: predicate not resolved - the pre-#34 uid rule is in effect (expected on Magisk/APatch; on a KernelSU device that is a GAP)"
+else
+    bad "gate: no decision line in dmesg - the ksu_umount_gate layer never ran"
+fi
 loaded || { sec "result"; echo "  not loaded - the dmesg above is the evidence"; echo "  tally: $PASS pass, $FAIL fail, $NOTE note"; finish 1; }
 
 sec "2. the 13 hooks went in as the FIRST node of their lists (ahead of SELinux)"

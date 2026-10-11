@@ -15,9 +15,11 @@
  *     Nothing here depends on which loader ran the module or on the SELinux domain it ran in, so no
  *     loader-side detection is needed either.
  *
- * The answer is decided once, here, and the gates only read the flag afterwards.  Consequence worth
- * knowing: a KernelSU loaded after this module is not noticed until this module is reloaded, which the
- * warning below says out loud. */
+ * The answer is decided once, here, and the gates only read the flag afterwards.  Two consequences
+ * worth knowing.  A KernelSU loaded AFTER this module is not noticed until this module is reloaded
+ * (the warning below says so).  A KernelSU that is UNLOADED leaves the saved address dangling - a call
+ * would jump into freed module text; the strong import this replaced had exactly the same exposure,
+ * since nothing holds a reference for us either, so that is a known residual rather than a new one. */
 
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -29,10 +31,16 @@
 
 #define KSU_UMOUNT_GATE_SYMBOL	"ksu_uid_should_umount"
 
-bool susfs_ksu_umount_gate_off;
+/* Fail-safe default: the pre-#34 answer, until the init below proves that KernelSU's symbol exists.
+ * A path that skips that init entirely - the fail_layer=1 diagnostic in susfs_main.c is one, and this
+ * layer is deliberately not fatal - therefore leaves the gates on the safe branch instead of calling
+ * through a NULL pointer.  Only a successful resolve turns it off. */
+bool susfs_ksu_umount_gate_off = true;
 
-/* Written once in init, read by every gate through susfs_ksu_umount_ask().  NULL only while the gate
- * is off, which is the invariant the helper relies on instead of testing the pointer on every call. */
+/* Written once in init, read by every gate through susfs_ksu_umount_ask().  Non-NULL exactly while
+ * the gate is off == false, which is the invariant the helper relies on instead of testing the
+ * pointer on every call; the default above is what makes that invariant hold even when init is
+ * skipped. */
 static bool (*ksu_uid_should_umount_fn)(uid_t uid);
 
 /* noinline __nocfi: an indirect call through a resolved address.  CFI checks indirect call sites, and
@@ -56,6 +64,7 @@ int susfs_ksu_umount_gate_init(void)
 	}
 
 	ksu_uid_should_umount_fn = (bool (*)(uid_t))addr;
+	susfs_ksu_umount_gate_off = false;	/* only now is there something to ask */
 	SUSFS_LOGI("ksu_umount_gate: resolved %s at %px - the hide gates now answer KernelSU (issue #34)\n",
 		   KSU_UMOUNT_GATE_SYMBOL, (void *)addr);
 	return 0;

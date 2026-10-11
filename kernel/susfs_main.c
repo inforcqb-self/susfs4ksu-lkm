@@ -95,7 +95,8 @@ static struct {
 } susfs_layers[] = {
     /* First, and NOT fatal: this layer only decides whether KernelSU's predicate was found at load.
      * When it was not, the gates answer the pre-#34 way and every other layer still works - so a
-     * failure here is a degradation, not a reason to refuse the module. */
+     * failure here is a degradation, not a reason to refuse the module.  Skipping this init entirely
+     * (fail_layer=1) is safe for the same reason: the flag it sets defaults to the pre-#34 answer. */
     { "ksu_umount_gate", susfs_ksu_umount_gate_init,	NULL,			false, false },
     { "lsm_hook",	layer_lsm_hook_init,		ksu_lsm_hook_exit,	false, false },
     { "sus_path",	sus_path_init,			sus_path_exit,		true,  false },
@@ -112,7 +113,9 @@ static struct {
 };
 
 /* Diagnostic: make one layer's init fail, by 1-based index, to exercise the rollback path
- * on the device - a `fatal` layer failing must leave the load with nothing armed. */
+ * on the device - a `fatal` layer failing must leave the load with nothing armed.
+ * `fail_layer=1` skips the ksu_umount_gate init WITHOUT failing the load (that layer is not fatal),
+ * which is safe only because its flag defaults to the pre-#34 answer - see ksu_umount_gate.c. */
 static int fail_layer;
 module_param_named(fail_layer, fail_layer, int, 0644);
 
