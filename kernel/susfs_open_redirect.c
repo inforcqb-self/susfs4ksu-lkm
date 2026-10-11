@@ -633,12 +633,21 @@ static bool or_registered;
 static bool or_dpath_registered;
 static bool or_statfs_registered;
 
+/* Set by susfs_open_redirect_exit() while it holds or_lock; registration refuses afterwards.
+ * The /proc node does NOT hold a module reference (proc_create(..., NULL, ...) takes no owner),
+ * so a write that is already inside or_proc_write() can reach or_register() while the module is
+ * being torn down: without this flag the forward probe would be registered again after
+ * or_unregister() cleared or_registered, and its handler would outlive the module. */
+static bool or_exiting;
+
 /* The forward hook is the feature: a rule that cannot fire is worse than no rule, so its
  * registration failure is reported to the caller. */
 static int or_register(void)
 {
 	int rc;
 
+	if (or_exiting)
+		return -ENODEV;
 	if (or_registered)
 		return 0;
 	rc = register_kprobe(&kp_or);
@@ -661,6 +670,9 @@ static int or_register(void)
 static void or_register_reverse(void)
 {
 	int rc;
+
+	if (or_exiting)
+		return;
 
 	if (!or_dpath_registered) {
 		rc = register_kprobe(&kp_or_dpath);
@@ -709,6 +721,10 @@ static void or_register_reverse(void)
 	}
 }
 
+/* Caller MUST hold or_lock: disarming outside it is what let a concurrent or_register() put the
+ * probes back after they were removed - and those probes would then point into a module that is
+ * about to be freed.  susfs_open_redirect_exit() takes the lock and sets or_exiting before it
+ * calls this, so no registration can slip in between. */
 static void or_unregister(void)
 {
 	if (or_fdinfo_registered) {
@@ -786,7 +802,15 @@ void susfs_open_redirect_exit(void)
 {
 	int i;
 
+	/* "Stop accepting registrations" and "drop the probes" are one critical section: a /proc
+	 * write holds no module reference, so it can be sitting inside or_proc_write() right now,
+	 * and it would otherwise walk into or_register() after or_unregister() had cleared
+	 * or_registered - re-arming kp_or with a handler that outlives the module. */
+	mutex_lock(&or_lock);
+	or_exiting = true;
 	or_unregister();
+	mutex_unlock(&or_lock);
+
 	if (or_proc_entry) {
 		proc_remove(or_proc_entry);
 		or_proc_entry = NULL;
