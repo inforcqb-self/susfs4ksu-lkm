@@ -69,6 +69,15 @@
  * include/uapi/asm-generic/unistd.h:183 (openat 56) and :854 (openat2 437). */
 #define SUSFS_COMPAT_NR_OPEN		5
 #define SUSFS_COMPAT_NR_OPENAT		322
+/* The AArch32 openat2 slot carries the same number as the native one but is a DIFFERENT array
+ * element: arch/arm64/include/asm/unistd32.h:884-885 registers it as
+ * `__SYSCALL(__NR_openat2, sys_openat2)` - the NATIVE implementation, not a compat wrapper - and
+ * arch/arm64/kernel/sys32.c:130 turns that into
+ * `compat_sys_call_table[437] = __arm64_sys_openat2`.  Patching sys_call_table[437] therefore
+ * does not patch this element, and a 32-bit task calling openat2(..., O_PATH) would walk past
+ * the layer entirely.  It needs its own entry, its own wrapper and its own original slot even
+ * though both slots hold the same function. */
+#define SUSFS_COMPAT_NR_OPENAT2		437
 
 /* The BTI landing pad an indirect call into this module has to land on.  fp_has_landing_pad()
  * in susfs_fp_hook.c is static and is what susfs_fp_install() refuses a wrapper with; the same
@@ -188,19 +197,33 @@ static __nocfi long susfs_opath_post(long ret)
  * The NULL test on the slot is not about the publish order - susfs_fp_install() publishes the
  * original before it writes the table, so a live entry always has one - it is what turns a
  * future mistake there into one failed open (-ENOSYS) instead of a jump to address 0. */
-/* The third parameter says whether this entry's flags sit in regs->regs[2]: openat and the
- * AArch32 open/openat all carry dirfd, path, flags, mode in the first four registers, so for
- * them the flags test runs BEFORE fget_raw() and an ordinary open pays one register read and one
- * taken branch instead of an fget_raw()/fput() pair.  That skip is exact rather than a
- * shortcut - do_dentry_open() sets FMODE_PATH only for an O_PATH open (fs/open.c:801-805), so an
- * open whose flags lack O_PATH cannot return the kind of file this layer looks at.
- * openat2 keeps its flags in a struct open_how in user memory and passes 0: it always runs the
- * full post-check.  A fast path there would need a copy_from_user() for a syscall libc never
- * issues by itself, and a failed copy would have to fall back to the full check anyway.
+/* The third parameter is the REGISTER INDEX that holds this entry's flags (-1 = "not in a
+ * register", see openat2 below), because the register is NOT the same for every entry:
+ * arm64 puts a syscall's arguments in regs->regs[0..5] for native and compat alike
+ * (arch/arm64/include/asm/syscall_wrapper.h:13-16, used for COMPAT_SYSCALL_DEFINEx at :27), so
+ * the index is just the argument number counting from 0:
+ *   - openat (fs/open.c:1336) and the AArch32 openat (fs/open.c:1383) are (dfd, filename,
+ *     flags, mode): flags is argument 3 -> regs->regs[2];
+ *   - the AArch32 open (fs/open.c:1374) is COMPAT_SYSCALL_DEFINE3: there is no dirfd, so the
+ *     arguments are (filename, flags, mode) and the flags are argument 2 -> regs->regs[1].
+ *     Reading regs[2] there would test the MODE, which is 0 or 0644/0755 in practice, and the
+ *     layer would quietly skip every 32-bit open() it exists to catch.
+ *   - openat2 (fs/open.c:1344) has a struct open_how __user * as argument 3: no flags to read,
+ *     so it passes -1 and always runs the full post-check.  A fast path there would need a
+ *     copy_from_user() for a syscall libc never issues by itself, and a failed copy would have
+ *     to fall back to the full check anyway.
+ * With a readable register the flags test runs BEFORE fget_raw(), so an ordinary open pays one
+ * register read and one taken branch instead of an fget_raw()/fput() pair.  The skip is exact
+ * rather than a shortcut - do_dentry_open() sets FMODE_PATH only for an O_PATH open
+ * (fs/open.c:801-805), so an open whose flags lack O_PATH cannot return the kind of file this
+ * layer looks at.  O_PATH is 010000000 for both ABIs (include/uapi/asm-generic/fcntl.h:85; the
+ * ARM overrides in arch/arm64/include/uapi/asm/fcntl.h:23-26 exist BECAUSE of the 32-bit ABI and
+ * leave O_PATH alone), and the 32-bit flags reach build_open_how() untranslated
+ * (fs/open.c:1374-1377), so one constant is right for both sides.
  * n_opath_seen is bumped here rather than in susfs_opath_post() so that a skipped ordinary open
  * still shows up as "a wrapper ran" - that counter is what tells a device bring-up apart
  * "the entry is not reached at all" from "the entry is reached and the O_PATH test says no". */
-#define SUSFS_OPATH_WRAPPER(fn, slot, flags_arg)			\
+#define SUSFS_OPATH_WRAPPER(fn, slot, flags_reg)			\
 	static __nocfi long fn(const struct pt_regs *regs)		\
 	{								\
 		susfs_syscall_fn_t orig = READ_ONCE(slot);		\
@@ -210,7 +233,7 @@ static __nocfi long susfs_opath_post(long ret)
 			return -ENOSYS;					\
 		ret = orig(regs);					\
 		atomic_inc(&n_opath_seen);				\
-		if ((flags_arg) && !(regs->regs[2] & O_PATH))		\
+		if ((flags_reg) >= 0 && !(regs->regs[flags_reg] & O_PATH))	\
 			return ret;					\
 		return susfs_opath_post(ret);				\
 	}
@@ -219,15 +242,34 @@ static susfs_syscall_fn_t opath_orig_openat;
 static susfs_syscall_fn_t opath_orig_openat2;
 static susfs_syscall_fn_t opath_orig_compat_open;
 static susfs_syscall_fn_t opath_orig_compat_openat;
+static susfs_syscall_fn_t opath_orig_compat_openat2;
 
-SUSFS_OPATH_WRAPPER(susfs_opath_openat, opath_orig_openat, 1)
-SUSFS_OPATH_WRAPPER(susfs_opath_openat2, opath_orig_openat2, 0)
+SUSFS_OPATH_WRAPPER(susfs_opath_openat, opath_orig_openat, 2)
+SUSFS_OPATH_WRAPPER(susfs_opath_openat2, opath_orig_openat2, -1)
 SUSFS_OPATH_WRAPPER(susfs_opath_compat_open, opath_orig_compat_open, 1)
-SUSFS_OPATH_WRAPPER(susfs_opath_compat_openat, opath_orig_compat_openat, 1)
+SUSFS_OPATH_WRAPPER(susfs_opath_compat_openat, opath_orig_compat_openat, 2)
+SUSFS_OPATH_WRAPPER(susfs_opath_compat_openat2, opath_orig_compat_openat2, -1)
 
-/* The four entries.  nr < 0 means "no native entry": arm64 has no native open at all, and for
+/* The five entries.  nr < 0 means "no native entry": arm64 has no native open at all, and for
  * the AArch32 open(5) the native number 5 is setxattr (include/uapi/asm-generic/unistd.h:47) -
  * so the compat-only hooks carry their index in nr_compat and leave the native table alone.
+ * openat2 is the one syscall that needs an entry in BOTH tables (see SUSFS_COMPAT_NR_OPENAT2),
+ * which is why it appears twice: same number, two array elements, two hooks.
+ * The combinations, one line each (nr / nr_compat), which is also what struct susfs_fp_hook
+ * documents:
+ *   openat        :  56 / 0   - native only; the AArch32 openat is a different number (322) and
+ *                               its own entry below.
+ *   openat2       : 437 / 0   - native only.  A 32-bit task never reads this table - it
+ *                               dispatches through compat_sys_call_table
+ *                               (arch/arm64/kernel/syscall.c:185-189) - and the kernel fills
+ *                               that table's slot 437 with __arm64_sys_openat2 as well
+ *                               (arch/arm64/include/asm/unistd32.h:884-885).  Same function,
+ *                               DIFFERENT array element: patching the native slot leaves the
+ *                               32-bit one untouched, which is why the fifth line below exists.
+ *   compat open   :  -1 / 5   - compat only: there is no native open to patch.
+ *   compat openat :  -1 / 322 - compat only, same reason; native openat is 56.
+ *   compat openat2:  -1 / 437 - compat only, same number as the native slot but a different
+ *                               element (SUSFS_COMPAT_NR_OPENAT2).
  *
  * __NR_openat2 is used under #ifdef: the number only exists in a kernel that has the syscall,
  * and the index handed to the table must be the kernel's own idea of it, never a constant
@@ -249,6 +291,18 @@ static struct susfs_fp_hook opath_hooks[] = {
 		.wrapper	= susfs_opath_openat2,
 		.orig_slot	= &opath_orig_openat2,
 	},
+	/* The 32-bit side of the same syscall is a separate table element - see
+	 * SUSFS_COMPAT_NR_OPENAT2 - so it gets a hook of its own rather than an nr_compat on the
+	 * one above: the two are independent elements and either can be missing on a kernel of
+	 * its own, which is exactly what per-hook install/logging is for. */
+	{
+		.nr		= -1,
+		.nr_compat	= SUSFS_COMPAT_NR_OPENAT2,
+		.name		= "opath/compat openat2",
+		.sym		= "__arm64_sys_openat2",
+		.wrapper	= susfs_opath_compat_openat2,
+		.orig_slot_compat = &opath_orig_compat_openat2,
+	},
 #endif
 	{
 		.nr		= -1,
@@ -257,7 +311,6 @@ static struct susfs_fp_hook opath_hooks[] = {
 		.sym		= "__arm64_compat_sys_open",
 		.wrapper	= susfs_opath_compat_open,
 		.orig_slot_compat = &opath_orig_compat_open,
-		.compat		= true,
 	},
 	{
 		.nr		= -1,
@@ -266,7 +319,6 @@ static struct susfs_fp_hook opath_hooks[] = {
 		.sym		= "__arm64_compat_sys_openat",
 		.wrapper	= susfs_opath_compat_openat,
 		.orig_slot_compat = &opath_orig_compat_openat,
-		.compat		= true,
 	},
 };
 
@@ -307,8 +359,8 @@ static void susfs_opath_dump_all(void)
 	for (i = 0; i < (int)ARRAY_SIZE(opath_hooks); i++) {
 		struct susfs_fp_hook *h = &opath_hooks[i];
 
-		pr_info("opath dump: [%d] %s nr=%d nr_compat=%d compat=%d wrapper=%px bti_c=%d\n",
-			i + 1, h->name, h->nr, h->nr_compat, (int)h->compat,
+		pr_info("opath dump: [%d] %s nr=%d nr_compat=%d wrapper=%px bti_c=%d\n",
+			i + 1, h->name, h->nr, h->nr_compat,
 			(void *)h->wrapper, (int)opath_has_landing_pad((const void *)h->wrapper));
 
 		/* susfs_fp_dump_entry() prints the native table only, so the compat entries are
