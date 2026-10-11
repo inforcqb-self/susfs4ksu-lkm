@@ -22,6 +22,7 @@
 #include <linux/err.h>		/* IS_ERR/ERR_PTR for the getlink hook */
 #include <linux/cred.h>		/* current_uid(), for the read gate */
 #include <linux/spinlock.h>	/* serialises rule publication */
+#include <linux/mutex.h>	/* map_ctl_lock: serialises probe arming */
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
@@ -620,12 +621,23 @@ static const struct kernel_param_ops sus_map_stat_ops = {
 };
 module_param_cb(map_stat, &sus_map_stat_ops, NULL, 0400);
 
+/* Serialises probe arming.  register_kprobe() answers -EINVAL once another task has resolved
+ * .addr, and the failure branch below clears .addr - without this lock that disarms a probe that
+ * is LIVE: its breakpoint stays installed and unregister_kprobe() can no longer take it out, so
+ * it would survive the unload with a handler pointing into freed module text.  Two tasks can add
+ * a rule at the same time (every supercall runs in its own task_work), and susfs_sus_map_init()
+ * reaches this too. */
+static DEFINE_MUTEX(map_ctl_lock);
+
 /* Registers whichever of the probes are not up yet.  Called from init (when a rule
  * already exists) and from the supercall that adds the first rule, so both paths arm
  * exactly the same set. */
 static int sus_map_register_probes(void)
 {
     int i, n = 0, first_err = 0;
+    int ret;
+
+    mutex_lock(&map_ctl_lock);
 
     sus_map_resolve_walk_ops();
 
@@ -673,7 +685,10 @@ static int sus_map_register_probes(void)
     }
 
     map_registered = map_probe_armed[0];   /* show_map_vma is the required one */
-    return map_registered ? 0 : first_err;
+    ret = map_registered ? 0 : first_err;
+
+    mutex_unlock(&map_ctl_lock);
+    return ret;
 }
 
 

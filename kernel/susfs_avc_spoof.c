@@ -14,6 +14,7 @@
 #include <linux/uaccess.h>
 #include <linux/string.h>
 #include <linux/cred.h>	/* current_uid(), control-node gate */
+#include <linux/mutex.h>	/* avc_ctl_lock: serialises the arm/disarm pair */
 #include <linux/version.h>	/* LINUX_VERSION_CODE: slow_avc_audit() lost its leading `state` in 6.4 */
 #include "susfs_abi.h"
 #include "susfs_log.h"
@@ -76,35 +77,55 @@ static struct kprobe kp_avc = {
 	.pre_handler = avc_audit_post_pre,
 };
 
+/* Serialises the arm/disarm pair.  register_kprobe() resolves .symbol_name only while .addr is
+ * NULL and answers -EINVAL once both are set, so a *successful* registration by another task
+ * makes this task's register_kprobe() fail - and the failure branch below clears .addr.  Without
+ * this lock that clears the address of a probe that is LIVE: unregister_kprobes() only runs a
+ * probe's bottom half `if (kps[i]->addr)`, so the breakpoint then survives the unload with its
+ * handler pointing into freed module text.  Two independent entries reach avc_register()
+ * (/proc/susfs_avc_spoof and the supercall, which runs in each caller's task_work), which is the
+ * same shape sus_mount_ctl_lock and or_lock were added for. */
+static DEFINE_MUTEX(avc_ctl_lock);
+
 static int avc_register(void)
 {
 	int rc;
 
-	if (avc_registered)
+	mutex_lock(&avc_ctl_lock);
+	if (avc_registered) {
+		mutex_unlock(&avc_ctl_lock);
 		return 0;
+	}
 	rc = register_kprobe(&kp_avc);
 	if (rc) {
 		/* The failure that matters is reported to the caller, but the address the kernel
 		 * resolved is already in the struct: without this the retry a later enable makes
-		 * would be refused with -EINVAL (see susfs_kprobe.h). */
+		 * would be refused with -EINVAL (see susfs_kprobe.h).  Safe under the lock - no
+		 * other task can be holding a successful registration of this probe. */
 		susfs_kp_forget_addr(&kp_avc);
+		mutex_unlock(&avc_ctl_lock);
 		return rc;
 	}
 	avc_registered = true;
+	mutex_unlock(&avc_ctl_lock);
 	SUSFS_LOGI("susfs_avc_spoof: hook installed (slow_avc_audit)\n");
 	return 0;
 }
 
 static void avc_unregister(void)
 {
-	if (!avc_registered)
+	mutex_lock(&avc_ctl_lock);
+	if (!avc_registered) {
+		mutex_unlock(&avc_ctl_lock);
 		return;
+	}
 	unregister_kprobe(&kp_avc);
 	/* A successful unregister leaves .addr set (only a probe that was never on a list gets it
 	 * cleared), so "disarmed" has to mean it here too: writing 0 and then 1 is the documented
 	 * way to restart the spoof, and it used to end with the hook permanently gone. */
 	susfs_kp_forget_addr(&kp_avc);
 	avc_registered = false;
+	mutex_unlock(&avc_ctl_lock);
 	SUSFS_LOGI("susfs_avc_spoof: hook removed\n");
 }
 

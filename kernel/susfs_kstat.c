@@ -417,36 +417,52 @@ static struct kretprobe krp_kstat_map_vma = {
 
 static bool kstat_maps_registered;
 
-/* Registering sleeps, so this runs from the rule-management paths (kstat_lock held, process context). */
+/* Registering sleeps, so this runs from the rule-management paths (process context).  It is NOT
+ * called under kstat_lock - both call sites arm after unlocking it, deliberately - so the
+ * check-then-act below needs a lock of its own: register_kretprobe() answers -EINVAL once another
+ * task has resolved .addr, and the failure branch clears .addr, which without this lock disarms a
+ * probe that is LIVE (its breakpoint stays installed, and unregister_kretprobe() can no longer
+ * take it out).  sus_mount_ctl_lock and or_lock exist for the same reason. */
+static DEFINE_MUTEX(kstat_maps_ctl_lock);
+
 static void kstat_maps_arm(void)
 {
 	int rc;
 
-	if (kstat_maps_registered)
+	mutex_lock(&kstat_maps_ctl_lock);
+	if (kstat_maps_registered) {
+		mutex_unlock(&kstat_maps_ctl_lock);
 		return;
+	}
 	rc = register_kretprobe(&krp_kstat_map_vma);
 	if (rc) {
 		/* Every later rule operation retries this arming (kstat_maps_arm() is called from
 		 * the add/update/clear paths and from the supercall), so the struct has to come back
 		 * clear: a failure that happened after the symbol was resolved leaves .addr set, and
 		 * the retry would be refused with -EINVAL instead of trying again - see
-		 * susfs_kprobe.h. */
+		 * susfs_kprobe.h.  Safe under the lock. */
 		susfs_krp_forget_addr(&krp_kstat_map_vma);
+		mutex_unlock(&kstat_maps_ctl_lock);
 		pr_warn("susfs_kstat: register_kretprobe(show_map_vma) failed %d - maps keeps printing the real dev:ino\n",
 			rc);
 	} else {
 		kstat_maps_registered = true;
+		mutex_unlock(&kstat_maps_ctl_lock);
 		SUSFS_LOGI("susfs_kstat: maps hook armed (kretprobe show_map_vma)\n");
 	}
 }
 
 static void kstat_maps_disarm(void)
 {
-	if (!kstat_maps_registered)
+	mutex_lock(&kstat_maps_ctl_lock);
+	if (!kstat_maps_registered) {
+		mutex_unlock(&kstat_maps_ctl_lock);
 		return;
+	}
 	unregister_kretprobe(&krp_kstat_map_vma);
 	susfs_krp_forget_addr(&krp_kstat_map_vma);
 	kstat_maps_registered = false;
+	mutex_unlock(&kstat_maps_ctl_lock);
 }
 
 /* rewrite the requested fields of the native user statbuf */
