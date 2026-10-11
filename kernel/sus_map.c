@@ -714,6 +714,12 @@ void susfs_sus_map_exit(void)
 {
     int i;
 
+    /* Same lock as the registration side.  The arm path is check-then-act on map_probe_armed[],
+     * so disarming without it would break the invariant the duplicate-registration fix
+     * established: one probe's arm and disarm belong under the same lock.  (No /proc write
+     * reaches the arm path today - it runs from init and the supercall, and the supercall's
+     * task_work holds a module reference - so this is symmetry rather than a live window.) */
+    mutex_lock(&map_ctl_lock);
     for (i = 0; i < (int)N_MAP_PROBES; i++) {
         if (!map_probe_armed[i])
             continue;
@@ -727,6 +733,8 @@ void susfs_sus_map_exit(void)
         kr_map_files_ok = false;
     }
     map_registered = false;
+    mutex_unlock(&map_ctl_lock);
+
     nmap = 0;
 }
 

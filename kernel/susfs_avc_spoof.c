@@ -87,11 +87,21 @@ static struct kprobe kp_avc = {
  * same shape sus_mount_ctl_lock and or_lock were added for. */
 static DEFINE_MUTEX(avc_ctl_lock);
 
+/* Set by susfs_avc_spoof_exit() while it holds the lock; registration refuses afterwards.  The
+ * /proc node holds no module reference, so a write already inside avc_proc_write() can reach
+ * avc_register() during teardown and install the probe again after it was disarmed - its handler
+ * would then point into a module that is about to be freed. */
+static bool avc_exiting;
+
 static int avc_register(void)
 {
 	int rc;
 
 	mutex_lock(&avc_ctl_lock);
+	if (avc_exiting) {
+		mutex_unlock(&avc_ctl_lock);
+		return -ENODEV;
+	}
 	if (avc_registered) {
 		mutex_unlock(&avc_ctl_lock);
 		return 0;
@@ -112,19 +122,25 @@ static int avc_register(void)
 	return 0;
 }
 
-static void avc_unregister(void)
+/* Caller must hold avc_ctl_lock.  Kept separate from avc_unregister() because the exit path has to
+ * do the disarm and "refuse further registration" in ONE critical section - something the /proc
+ * write path (which also disarms, but must stay re-enablable) must not do. */
+static void avc_unregister_locked(void)
 {
-	mutex_lock(&avc_ctl_lock);
-	if (!avc_registered) {
-		mutex_unlock(&avc_ctl_lock);
+	if (!avc_registered)
 		return;
-	}
 	unregister_kprobe(&kp_avc);
 	/* A successful unregister leaves .addr set (only a probe that was never on a list gets it
 	 * cleared), so "disarmed" has to mean it here too: writing 0 and then 1 is the documented
 	 * way to restart the spoof, and it used to end with the hook permanently gone. */
 	susfs_kp_forget_addr(&kp_avc);
 	avc_registered = false;
+}
+
+static void avc_unregister(void)
+{
+	mutex_lock(&avc_ctl_lock);
+	avc_unregister_locked();
 	mutex_unlock(&avc_ctl_lock);
 	SUSFS_LOGI("susfs_avc_spoof: hook removed\n");
 }
@@ -229,7 +245,13 @@ int susfs_avc_spoof_init(void)
 
 void susfs_avc_spoof_exit(void)
 {
-	avc_unregister();
+	/* One critical section for "no more registrations" and the disarm: a /proc write holds no
+	 * module reference and can be inside avc_proc_write() right now. */
+	mutex_lock(&avc_ctl_lock);
+	avc_exiting = true;
+	avc_unregister_locked();
+	mutex_unlock(&avc_ctl_lock);
+
 	avc_spoof_enabled = false;
 	if (avc_proc_entry) {
 		proc_remove(avc_proc_entry);

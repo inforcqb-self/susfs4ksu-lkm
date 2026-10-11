@@ -432,11 +432,21 @@ static bool kstat_maps_registered;
  * take it out).  sus_mount_ctl_lock and or_lock exist for the same reason. */
 static DEFINE_MUTEX(kstat_maps_ctl_lock);
 
+/* Set by kstat_maps_disarm() while it holds the lock.  kstat_maps_arm() is reachable from the
+ * /proc node (kstat_proc_write) as well as the supercall, and the node holds no module reference,
+ * so without this a write that is already inside the handler could arm the kretprobe again after
+ * the module started going away - its handler would then outlive the module. */
+static bool kstat_maps_exiting;
+
 static void kstat_maps_arm(void)
 {
 	int rc;
 
 	mutex_lock(&kstat_maps_ctl_lock);
+	if (kstat_maps_exiting) {
+		mutex_unlock(&kstat_maps_ctl_lock);
+		return;
+	}
 	if (kstat_maps_registered) {
 		mutex_unlock(&kstat_maps_ctl_lock);
 		return;
@@ -462,6 +472,9 @@ static void kstat_maps_arm(void)
 static void kstat_maps_disarm(void)
 {
 	mutex_lock(&kstat_maps_ctl_lock);
+	/* The only caller is susfs_kstat_exit(), so "stop accepting arms" and "drop the probe" can
+	 * be one critical section - exactly what the /proc-reachable arm path needs. */
+	kstat_maps_exiting = true;
 	if (!kstat_maps_registered) {
 		mutex_unlock(&kstat_maps_ctl_lock);
 		return;
@@ -1073,9 +1086,11 @@ static bool susfs_kstat_spoof_statx(struct kstat_call_state *st, unsigned long s
 
 	if ((e->flags & KSTAT_SPOOF_DEV) && (eff & STATX_BASIC_STATS)) {
 		unsigned int enc = (unsigned int)e->spoofed_dev;
-
-		u16 maj = (u16)((enc & 0xfff00u) >> 8);
-		u16 min = (u16)MINOR(new_decode_dev(enc));
+		/* stx_dev_major/minor are u32 each: write all four bytes of each half.  Writing a u16
+		 * per half would leave the upper bytes of the real device number behind for any minor
+		 * that does not fit 16 bits. */
+		unsigned int maj = (enc & 0xfff00u) >> 8;
+		unsigned int min = MINOR(new_decode_dev(enc));
 
 		if (copy_to_user((void __user *)(sbuf + o->dev), &maj, sizeof(maj))) {
 			atomic_inc(&st->cnt->uaccess);
