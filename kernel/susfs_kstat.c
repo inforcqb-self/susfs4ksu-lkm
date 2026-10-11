@@ -19,9 +19,14 @@
  * Hook strategy (LTO on this GKI inlines the stat chain vfs_fstatat -> vfs_statx -> vfs_getattr ->
  * cp_new_stat, so VFS-layer kprobes miss): the reliable hook is the RETURN of the stat syscall,
  * where the user statbuf is fully written - caught on the ONE global sys_exit tracepoint
- * (kstat_sys_exit()), which whitelists newfstatat(79), fstat(80) and statx(291) per caller ABI and
- * rewrites the requested fields of the user buffer there via copy_to_user.  Field offsets are arm64
- * asm-generic struct stat / struct statx, checked against offsetof() with static_assert().  The
+ * (kstat_sys_exit()), which whitelists the numbers PER CALLER ABI and rewrites the requested fields
+ * of the user buffer there via copy_to_user.  Native: newfstatat(79), fstat(80), statx(291).
+ * AArch32: fstatat64(327), stat64(195), lstat64(196), fstat64(197) -> struct stat64; stat(106),
+ * lstat(107), fstat(108) -> struct compat_stat; statx(397) -> the SAME struct statx as native
+ * (unistd32.h maps 397 to the native statx body, and struct statx is a fixed-width uapi struct, so
+ * only the pointers are 32-bit).  Field offsets are arm64 asm-generic struct stat / struct statx
+ * (offsetof + static_assert), the ARM EABI struct stat64 (hand-derived, see the note above
+ * STAT64_ST_DEV_OFF) and struct compat_stat (offsetof + static_assert).  The
  * vfs_getattr kretprobe that used to stand behind this as a lower-layer fallback is GONE: its
  * removal and what replaced it are explained in the note above struct kstat_call_counters.
  */
@@ -500,12 +505,17 @@ static void kstat_maps_disarm(void)
  * points this module serves.  The per-number counters below answer the question its two counters
  * existed for, since "registered" and "reached" are different claims everywhere in this module.
  *
- * The gap the deletion leaves: AArch32 __NR_stat 106 / __NR_lstat 107 / __NR_fstat 108 fill
- * struct compat_stat, whose offsets this file does not carry (see the compat note above
- * STAT64_ST_DEV_OFF).  The kretprobe was the only hook that could have covered them on the way
- * out, so a 32-bit caller's stat()/lstat()/fstat() reads the real numbers while its
- * stat64()/fstat64() are spoofed - a one-call oracle, and it stays one until those offsets are
- * wired in (a separate change, not half-done here). */
+ * Coverage today (this note used to list a gap; it is closed): the whitelist above covers every
+ * statbuf entry point a 32-bit or 64-bit caller has on arm64 - the three native numbers, the four
+ * struct stat64 numbers, the three struct compat_stat numbers (106/107/108) and AArch32's statx
+ * (397).  Numbers in the stat range that are still NOT here (the compat numbers of other ABIs, and
+ * anything a future kernel adds) are counted by kstat_note_unlisted() below.
+ *
+ * What this hook structurally CANNOT cover: anything that fills a statbuf without going through a
+ * user syscall exit.  io_uring's IORING_OP_STATX / IORING_OP_FSTAT call vfs_statx() from a worker
+ * or from io_uring_enter, so the LSM layer (sus_path's inode_getattr slot) still answers ENOENT for
+ * a hidden file, but there is no sys_exit to rewrite and the caller sees the REAL numbers - see
+ * COVERAGE.md's io_uring row.  The same is true of an in-kernel caller of vfs_getattr. */
 struct kstat_call_counters {
 	atomic_t calls;		/* this number returned 0: it reached the statbuf code */
 	atomic_t ret_err;	/* this number returned -errno */
@@ -516,6 +526,9 @@ struct kstat_call_counters {
 	atomic_t miss_lookup;	/* the (ino,dev) key matched no rule */
 	atomic_t match_noflag;	/* matched, but this buffer has no field we impersonate */
 	atomic_t uaccess;	/* copy_from_user/copy_to_user failed */
+	atomic_t narrow;	/* matched, but a field was left ALONE: this buffer cannot represent
+				 * the value (32-bit ino/nlink/size in struct compat_stat - the
+				 * kernel answers those with -EOVERFLOW rather than truncate) */
 };
 
 #define KSTAT_COUNTERS(nm)						\
@@ -524,7 +537,7 @@ struct kstat_call_counters {
 		.no_buf = ATOMIC_INIT(0), .rewrite = ATOMIC_INIT(0),	\
 		.miss_empty = ATOMIC_INIT(0), .miss_gate = ATOMIC_INIT(0),\
 		.miss_lookup = ATOMIC_INIT(0), .match_noflag = ATOMIC_INIT(0),\
-		.uaccess = ATOMIC_INIT(0),				\
+		.uaccess = ATOMIC_INIT(0), .narrow = ATOMIC_INIT(0),	\
 	}
 
 KSTAT_COUNTERS(nfstatat);
@@ -534,7 +547,17 @@ KSTAT_COUNTERS(fstatat64);
 KSTAT_COUNTERS(stat64);
 KSTAT_COUNTERS(lstat64);
 KSTAT_COUNTERS(fstat64);
+/* struct compat_stat (AArch32 106/107/108) and AArch32 statx (397) get counters of their own:
+ * "the 64-bit path works" says nothing about the 32-bit one, and mixing the two would hide exactly
+ * that. */
+KSTAT_COUNTERS(compat_stat);
+KSTAT_COUNTERS(compat_statx);
 
+/* "Stat-range numbers the dispatcher did not know": the whitelist above covers every statbuf entry
+ * point arm64 gives either ABI (native 79/80/291, AArch32 106/107/108, 195/196/197, 327, 397), so a
+ * hit here means the kernel grew a new one, a number belongs to another ABI's table, or a tracer
+ * rewrote the syscall number.  The window is where stat numbers live (fs/stat.c's callers), not a
+ * claim about any particular number. */
 #define KSTAT_NR_SCAN_LO	106
 #define KSTAT_NR_SCAN_HI	600
 #define KSTAT_UNLISTED_SEEN	8
@@ -708,15 +731,21 @@ static bool susfs_kstat_spoof_statbuf(struct kstat_call_state *st, unsigned long
  *   __NR_stat 106, __NR_lstat 107, __NR_fstat 108 -> struct compat_stat
  *       (arch/arm64/include/asm/compat.h) via cp_compat_stat().  They ARE mapped in this tree's
  *       arch/arm64/include/asm/unistd32.h (106 -> compat_sys_newstat, 107 -> newlstat, 108 ->
- *       newfstat), and an earlier note here claimed the opposite, so a 32-bit caller using
- *       stat()/lstat()/fstat() gets the real numbers while its stat64()/fstat64() are spoofed - a
- *       one-call oracle.  Wiring them needs their own struct compat_stat offsets (st_dev+0, st_ino+4,
- *       st_nlink+10, st_size+20, st_blksize+24, st_blocks+28, atime+32/36, mtime+40/44, ctime+48/52),
- *       which is not a copy of the table below, so it stays a separate change rather than half-done
- *       here.  They are listed so nobody concludes "compat = compat_stat" and wires the wrong
- *       offsets - which is what this code used to do: st_ino was read at +4, the HIGH half of st_dev
- *       in stat64 and always 0, so the lookup could never match (a match would have written into
- *       st_dev/st_rdev).
+ *       newfstat) and they ARE handled now, by susfs_kstat_spoof_compat_stat() below - the third
+ *       layout, whose offsets are pinned with offsetof()/static_assert() right after this comment.
+ *       Their key is the same (ino, new_encode_dev(dev)) the other families carry, so the rule table
+ *       and susfs_kstat_lookup() are shared; what differs is the FIELD WIDTHS: st_ino is 32-bit,
+ *       st_nlink is 16-bit and st_size/st_blksize/st_blocks are 32-bit compat_off_t, so the write
+ *       side refuses a value this struct cannot represent exactly where the kernel refuses it too
+ *       (cp_compat_stat() answers -EOVERFLOW for an ino/nlink that does not fit and for a size above
+ *       MAX_NON_LFS) - that is what the per-number `narrow` counter counts.
+ *       AArch32 statx 397 is NOT a layout of its own: unistd32.h maps it to the native statx body,
+ *       and struct statx is a fixed-width uapi struct, so the STATX offsets below serve it unchanged
+ *       (only the buffer pointer is 32-bit and goes through compat_ptr()).
+ *       Struct stat64 and struct compat_stat must never be confused: this is what an earlier version
+ *       of this file did - it read the lookup key from struct stat64's +4 (the HIGH half of its
+ *       64-bit st_dev) for the 106/107/108 buffers, so the key could never match, and a match would
+ *       have written into st_dev/st_rdev.
  *
  * ALIGNMENT (these numbers were established twice): compat_u64/compat_s64 are
  * __attribute__((aligned(4))) only when CONFIG_COMPAT_FOR_U64_ALIGNMENT is set
@@ -741,6 +770,61 @@ static bool susfs_kstat_spoof_statbuf(struct kstat_call_state *st, unsigned long
 #define STAT64_ST_INO_OFF       96	/* compat_u64 st_ino (also written; the KEY is read from +12) */
 #define STAT64_ST_SIZE          104
 
+/* struct compat_stat (the AArch32 stat()/lstat()/fstat() layout, 106/107/108).  Unlike the struct
+ * stat64 block above these are taken from the kernel's OWN type (linux/compat.h -> asm/compat.h),
+ * so a layout drift in any of the eight build variants fails the build instead of mis-writing a
+ * user buffer.  The numbers are identical on 5.15 and 6.6 (checked field by field); the asserts
+ * below are what keeps that true for 6.12/6.18 too.
+ *
+ * Field widths are the reason this needs its own write path and not a re-read of the stat64 one:
+ *   st_dev u32 (new_encode_dev, so the same key as every other family), st_ino u32, st_mode u16,
+ *   st_nlink u16, st_uid/st_gid u16, st_rdev u32, st_size/st_blksize/st_blocks s32 (compat_off_t),
+ *   st_atime/st_mtime/st_ctime s32 (old_time32_t) and their _nsec u32 (compat_ulong_t).
+ * cp_compat_stat() (fs/stat.c, identical in 5.15 and 6.6) writes exactly those, and it *refuses*
+ * three of them instead of truncating: an ino or nlink that does not fit its 32/16 bits, and a size
+ * above MAX_NON_LFS, all answer -EOVERFLOW.  The write-back below follows the same rule (skip the
+ * field, count it in `narrow`) rather than writing a value the kernel itself would never have put
+ * there.  st_blksize/st_blocks/the timestamps are plain assignments in the kernel, so those are
+ * written at their own width like it does. */
+#define COMPAT_STAT_ST_DEV_OFF		((int)offsetof(struct compat_stat, st_dev))
+#define COMPAT_STAT_ST_INO_OFF		((int)offsetof(struct compat_stat, st_ino))
+#define COMPAT_STAT_ST_NLINK_OFF	((int)offsetof(struct compat_stat, st_nlink))
+#define COMPAT_STAT_ST_SIZE_OFF		((int)offsetof(struct compat_stat, st_size))
+#define COMPAT_STAT_ST_BLKSIZE_OFF	((int)offsetof(struct compat_stat, st_blksize))
+#define COMPAT_STAT_ST_BLOCKS_OFF	((int)offsetof(struct compat_stat, st_blocks))
+#define COMPAT_STAT_ST_ATIME_OFF	((int)offsetof(struct compat_stat, st_atime))
+#define COMPAT_STAT_ST_ATIME_NSEC_OFF	((int)offsetof(struct compat_stat, st_atime_nsec))
+#define COMPAT_STAT_ST_MTIME_OFF	((int)offsetof(struct compat_stat, st_mtime))
+#define COMPAT_STAT_ST_MTIME_NSEC_OFF	((int)offsetof(struct compat_stat, st_mtime_nsec))
+#define COMPAT_STAT_ST_CTIME_OFF	((int)offsetof(struct compat_stat, st_ctime))
+#define COMPAT_STAT_ST_CTIME_NSEC_OFF	((int)offsetof(struct compat_stat, st_ctime_nsec))
+
+static_assert(offsetof(struct compat_stat, st_dev) == 0, "compat_stat.st_dev");
+static_assert(offsetof(struct compat_stat, st_ino) == 4, "compat_stat.st_ino");
+static_assert(offsetof(struct compat_stat, st_mode) == 8, "compat_stat.st_mode");
+static_assert(offsetof(struct compat_stat, st_nlink) == 10, "compat_stat.st_nlink");
+static_assert(offsetof(struct compat_stat, st_rdev) == 16, "compat_stat.st_rdev");
+static_assert(offsetof(struct compat_stat, st_size) == 20, "compat_stat.st_size");
+static_assert(offsetof(struct compat_stat, st_blksize) == 24, "compat_stat.st_blksize");
+static_assert(offsetof(struct compat_stat, st_blocks) == 28, "compat_stat.st_blocks");
+static_assert(offsetof(struct compat_stat, st_atime) == 32, "compat_stat.st_atime");
+static_assert(offsetof(struct compat_stat, st_atime_nsec) == 36, "compat_stat.st_atime_nsec");
+static_assert(offsetof(struct compat_stat, st_mtime) == 40, "compat_stat.st_mtime");
+static_assert(offsetof(struct compat_stat, st_mtime_nsec) == 44, "compat_stat.st_mtime_nsec");
+static_assert(offsetof(struct compat_stat, st_ctime) == 48, "compat_stat.st_ctime");
+static_assert(offsetof(struct compat_stat, st_ctime_nsec) == 52, "compat_stat.st_ctime_nsec");
+static_assert(sizeof(struct compat_stat) == 64, "compat_stat size");
+/* The widths the write-back has to respect (see the note above): if any of these ever changed, the
+ * `narrow` decisions below would silently become wrong. */
+static_assert(sizeof(((struct compat_stat *)0)->st_dev) == 4, "compat_stat.st_dev width");
+static_assert(sizeof(((struct compat_stat *)0)->st_ino) == 4, "compat_stat.st_ino width");
+static_assert(sizeof(((struct compat_stat *)0)->st_nlink) == 2, "compat_stat.st_nlink width");
+static_assert(sizeof(((struct compat_stat *)0)->st_size) == 4, "compat_stat.st_size width");
+static_assert(sizeof(((struct compat_stat *)0)->st_blksize) == 4, "compat_stat.st_blksize width");
+static_assert(sizeof(((struct compat_stat *)0)->st_blocks) == 4, "compat_stat.st_blocks width");
+static_assert(sizeof(((struct compat_stat *)0)->st_atime) == 4, "compat_stat.st_atime width");
+static_assert(sizeof(((struct compat_stat *)0)->st_atime_nsec) == 4, "compat_stat.st_atime_nsec width");
+
 /* ARM EABI syscall numbers that fill struct stat64 (arch/arm64/include/asm/unistd32.h; the
  * statbuf argument position is from fs/stat.c's COMPAT_SYSCALL_DEFINE2/4). */
 /* AArch32 stat numbers, from the 32-bit ARM table (arch/arm/tools/syscall.tbl) - an arm64 tree
@@ -752,6 +836,17 @@ static bool susfs_kstat_spoof_statbuf(struct kstat_call_state *st, unsigned long
 #define COMPAT_STAT64_NR	195	/* stat64(path, statbuf) */
 #define COMPAT_LSTAT64_NR	196	/* lstat64(path, statbuf) */
 #define COMPAT_FSTAT64_NR	197	/* fstat64(fd, statbuf) */
+/* struct compat_stat trio: statbuf is args[1] in all three (COMPAT_SYSCALL_DEFINE2(newstat,
+ * filename, statbuf) and DEFINE2(newfstat, fd, statbuf) in fs/stat.c), and all three end in
+ * cp_compat_stat(). */
+#define COMPAT_STAT_NR		106	/* stat(path, struct compat_stat *) */
+#define COMPAT_LSTAT_NR		107	/* lstat(path, struct compat_stat *) */
+#define COMPAT_FSTAT_NR		108	/* fstat(fd, struct compat_stat *) */
+/* AArch32 statx: yes, 32-bit callers have it (unistd32.h:397), and it is the NATIVE statx body -
+ * fs/stat.c has no COMPAT_SYSCALL_DEFINE for statx on arm64 - filling the same 256-byte
+ * struct statx at a zero-extended 32-bit pointer.  statbuf is args[4] and the requested mask
+ * args[3], exactly as in the native case; only the counter differs (see KSTAT_COUNTERS above). */
+#define COMPAT_STATX_NR		397	/* statx(dfd, path, flags, mask, struct statx *) */
 
 struct kstat_nr_entry {
 	long nr;
@@ -767,6 +862,13 @@ static struct kstat_nr_entry kstat_nr_table[] = {
 	{ COMPAT_STAT64_NR,    "stat64/compat",    &cnt_stat64 },
 	{ COMPAT_LSTAT64_NR,   "lstat64/compat",   &cnt_lstat64 },
 	{ COMPAT_FSTAT64_NR,   "fstat64/compat",   &cnt_fstat64 },
+	/* The struct compat_stat trio and AArch32 statx: separate rows on purpose - a 32-bit caller
+	 * that only ever uses stat()/lstat()/fstat() (no stat64) would otherwise be invisible in this
+	 * table, and that is precisely the case the offsets above exist for. */
+	{ COMPAT_STAT_NR,      "stat/compat",      &cnt_compat_stat },
+	{ COMPAT_LSTAT_NR,     "lstat/compat",     &cnt_compat_stat },
+	{ COMPAT_FSTAT_NR,     "fstat/compat",     &cnt_compat_stat },
+	{ COMPAT_STATX_NR,     "statx/compat",     &cnt_compat_statx },
 };
 
 /* compat (32-bit) statbuf: struct stat64 (see above) - the layout all four handled syscalls use. */
@@ -898,6 +1000,160 @@ static bool susfs_kstat_spoof_compat_statbuf(struct kstat_call_state *st, unsign
 	if (e->flags & KSTAT_SPOOF_CTIME_TV_NSEC) {
 		v32 = (unsigned int)e->spoofed_ctime_tv_nsec;
 		if (copy_to_user((void __user *)(statbuf + STAT64_ST_CTIME_NSEC_OFF), &v32, sizeof(v32))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+
+	if (!rewrote)
+		atomic_inc(&st->cnt->match_noflag);
+	else
+		atomic_inc(&st->cnt->rewrite);
+	return rewrote;
+}
+
+/* struct compat_stat (AArch32 stat/lstat/fstat, 106/107/108).  Same rule table and same lookup key
+ * as everything else; what this function exists for is the different field widths - see the note
+ * above COMPAT_STAT_ST_DEV_OFF.  The three refusals below mirror cp_compat_stat()'s -EOVERFLOW
+ * guards (ino, nlink, size): the kernel never puts a value in those fields that does not fit, so
+ * neither does this - the field keeps what the kernel wrote and the `narrow` counter is bumped,
+ * rather than handing the caller a truncated (and, for size, negative) number. */
+static bool susfs_kstat_spoof_compat_stat(struct kstat_call_state *st, unsigned long statbuf)
+{
+	struct sus_kstat_snapshot snap;
+	const struct sus_kstat_snapshot *e = &snap;
+	unsigned int ino = 0, dev = 0, v32;
+	unsigned short v16;
+	int v;
+	bool rewrote = false;
+
+	if (susfs_kstat_table_empty()) {
+		atomic_inc(&st->cnt->miss_empty);
+		return false;
+	}
+	if (!susfs_kstat_gate_ok()) {
+		atomic_inc(&st->cnt->miss_gate);
+		return false;
+	}
+
+	if (copy_from_user(&ino, (void __user *)(statbuf + COMPAT_STAT_ST_INO_OFF), sizeof(ino))) {
+		atomic_inc(&st->cnt->uaccess);
+		return false;
+	}
+	if (copy_from_user(&dev, (void __user *)(statbuf + COMPAT_STAT_ST_DEV_OFF), sizeof(dev))) {
+		atomic_inc(&st->cnt->uaccess);
+		return false;
+	}
+	if (!susfs_kstat_lookup(ino, dev, &snap)) {
+		atomic_inc(&st->cnt->miss_lookup);
+		return false;
+	}
+
+	if (e->flags & KSTAT_SPOOF_INO) {
+		if (e->spoofed_ino > 0xffffffffUL) {
+			atomic_inc(&st->cnt->narrow);
+		} else {
+			v32 = (unsigned int)e->spoofed_ino;
+			if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_INO_OFF), &v32, sizeof(v32))) {
+				atomic_inc(&st->cnt->uaccess);
+				return false;
+			}
+			rewrote = true;
+		}
+	}
+	if (e->flags & KSTAT_SPOOF_DEV) {
+		/* new_encode_dev() of a dev_t is a u32 by construction: always representable. */
+		v32 = (unsigned int)e->spoofed_dev;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_DEV_OFF), &v32, sizeof(v32))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_NLINK) {
+		if (e->spoofed_nlink > 0xffffU) {
+			atomic_inc(&st->cnt->narrow);
+		} else {
+			v16 = (unsigned short)e->spoofed_nlink;
+			if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_NLINK_OFF), &v16, sizeof(v16))) {
+				atomic_inc(&st->cnt->uaccess);
+				return false;
+			}
+			rewrote = true;
+		}
+	}
+	if (e->flags & KSTAT_SPOOF_SIZE) {
+		if (e->spoofed_size < 0 || e->spoofed_size > 0x7fffffffLL) {
+			atomic_inc(&st->cnt->narrow);
+		} else {
+			v = (int)e->spoofed_size;
+			if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_SIZE_OFF), &v, sizeof(v))) {
+				atomic_inc(&st->cnt->uaccess);
+				return false;
+			}
+			rewrote = true;
+		}
+	}
+	if (e->flags & KSTAT_SPOOF_BLKSIZE) {
+		v = (int)e->spoofed_blksize;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_BLKSIZE_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_BLOCKS) {
+		v = (int)e->spoofed_blocks;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_BLOCKS_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_ATIME_TV_SEC) {
+		v = (int)e->spoofed_atime_tv_sec;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_ATIME_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_ATIME_TV_NSEC) {
+		v32 = (unsigned int)e->spoofed_atime_tv_nsec;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_ATIME_NSEC_OFF), &v32, sizeof(v32))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_MTIME_TV_SEC) {
+		v = (int)e->spoofed_mtime_tv_sec;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_MTIME_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_MTIME_TV_NSEC) {
+		v32 = (unsigned int)e->spoofed_mtime_tv_nsec;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_MTIME_NSEC_OFF), &v32, sizeof(v32))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_CTIME_TV_SEC) {
+		v = (int)e->spoofed_ctime_tv_sec;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_CTIME_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_CTIME_TV_NSEC) {
+		v32 = (unsigned int)e->spoofed_ctime_tv_nsec;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_CTIME_NSEC_OFF), &v32, sizeof(v32))) {
 			atomic_inc(&st->cnt->uaccess);
 			return false;
 		}
@@ -1190,6 +1446,18 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 		case COMPAT_FSTAT64_NR:
 			c = &cnt_fstat64;
 			break;
+		case COMPAT_STAT_NR:
+		case COMPAT_LSTAT_NR:
+		case COMPAT_FSTAT_NR:
+			/* struct compat_stat, NOT struct stat64 - see the offsets and the widths
+			 * above; the two differ in every field after st_ino. */
+			c = &cnt_compat_stat;
+			break;
+		case COMPAT_STATX_NR:
+			/* A counter of its own: "64-bit statx is spoofed" says nothing about the
+			 * 32-bit one, and mixing them is how a 32-bit-only gap stayed invisible. */
+			c = &cnt_compat_statx;
+			break;
 		default:
 			c = NULL;
 			break;
@@ -1236,8 +1504,8 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 	 * made every 32-bit fstat64() return early - the rule applied to fstatat64, not to fstat64. */
 	/* Argument positions differ per number, so this stays a number switch - but only numbers
 	 * the gate above selected for THIS ABI can reach it, and the two ABIs' number sets
-	 * (79/80/291 native, 195/196/197/327 compat) do not overlap, so it needs no gate of its
-	 * own. */
+	 * (79/80/291 native; 106/107/108, 195/196/197, 327, 397 compat) do not overlap, so it needs
+	 * no gate of its own. */
 	switch (nr) {
 	case __NR_newfstatat:
 		syscall_get_arguments(current, regs, args);
@@ -1256,6 +1524,7 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 		susfs_kstat_spoof_statbuf(&st, args[1]);
 		return;
 	case __NR_statx:
+	case COMPAT_STATX_NR:	/* 397 IS the native statx body: same buffer, same mask, 32-bit ptr */
 
 		syscall_get_arguments(current, regs, args);
 		if (!args[4]) {
@@ -1285,6 +1554,21 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 			return;
 		}
 		susfs_kstat_spoof_compat_statbuf(&st, (unsigned long)compat_ptr((u32)args[1]));
+		return;
+	case COMPAT_STAT_NR:
+	case COMPAT_LSTAT_NR:
+	case COMPAT_FSTAT_NR:
+
+		/* stat(path, statbuf), lstat(path, statbuf), fstat(fd, statbuf): the buffer is
+		 * args[1] in all three (fs/stat.c: COMPAT_SYSCALL_DEFINE2(newstat, filename,
+		 * statbuf) and DEFINE2(newfstat, fd, statbuf)).  struct compat_stat, so the
+		 * write-back is susfs_kstat_spoof_compat_stat(), not the one above. */
+		syscall_get_arguments(current, regs, args);
+		if (!args[1]) {
+			atomic_inc(&c->no_buf);
+			return;
+		}
+		susfs_kstat_spoof_compat_stat(&st, (unsigned long)compat_ptr((u32)args[1]));
 		return;
 	}
 }
@@ -1722,13 +2006,13 @@ static int kstat_proc_show(struct seq_file *m, void *v)
 			struct kstat_call_counters *c = kstat_nr_table[i].cnt;
 
 			seq_printf(m,
-				   "stat nr %-16s (%ld): ok=%d rw=%d | err=%d nobuf=%d empty=%d gate=%d lookup=%d noflag=%d uacc=%d\n",
+				   "stat nr %-16s (%ld): ok=%d rw=%d | err=%d nobuf=%d empty=%d gate=%d lookup=%d noflag=%d uacc=%d narrow=%d\n",
 				   kstat_nr_table[i].name, kstat_nr_table[i].nr,
 				   atomic_read(&c->calls), atomic_read(&c->rewrite),
 				   atomic_read(&c->ret_err), atomic_read(&c->no_buf),
 				   atomic_read(&c->miss_empty), atomic_read(&c->miss_gate),
 				   atomic_read(&c->miss_lookup), atomic_read(&c->match_noflag),
-				   atomic_read(&c->uaccess));
+				   atomic_read(&c->uaccess), atomic_read(&c->narrow));
 		}
 		seq_printf(m, "stat unlisted-nr hits=%d (stat-range numbers the dispatcher did not know: last %d seen: %ld %ld %ld %ld %ld %ld %ld %ld)\n",
 			   atomic_read(&n_kstat_unlisted), (int)KSTAT_UNLISTED_SEEN,
