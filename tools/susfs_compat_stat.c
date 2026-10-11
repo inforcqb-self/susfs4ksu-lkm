@@ -219,6 +219,12 @@ static void show(const char *what, long rc)
 #define __NR_getdents 141
 #define __NR_getdents64 217
 #define DIRBUF 4096
+/* The buffer is poisoned before every read.  The module rewrites the length getdents64 hands
+ * back (syscall_set_return_value) to the length of the COMPACTED chain, so the residue it left
+ * behind sits past that length by construction - and so does whatever a previous, longer read
+ * left in the buffer.  A pattern that cannot occur in a record field or a name keeps the two
+ * apart: a hit can then only come from bytes this read actually wrote. */
+#define DIRBUF_POISON 0xA5
 
 static char dirbuf[DIRBUF];
 
@@ -233,12 +239,36 @@ static int name_is(const char *p, const char *needle)
 	return *p == 0;
 }
 
-/* Raw occurrence count over the WHOLE chunk, not just over the part the record chain
- * describes.  A caller is free to ignore the length getdents64 returned and search the bytes
- * itself, so a name that is only gone from the CHAIN is not hidden.  That is how the module
- * used to drop an entry: it compacted the chain and left the dropped record's bytes - the
- * whole name, its d_ino and its d_off - in the tail it no longer described, which is invisible
- * to the record walk below (it stops at n) and visible to this counter. */
+/* Could this byte be part of a file name?  Used to reject a needle that occurs inside a
+ * longer, visible name ("myopen600.bak" must not count as "open600"). */
+static int is_name_byte(unsigned char c)
+{
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+	       (c >= 'A' && c <= 'Z') || c == '_' || c == '-' || c == '.';
+}
+
+static void poison_dirbuf(void)
+{
+	long i;
+
+	for (i = 0; i < DIRBUF; i++)
+		dirbuf[i] = (char)DIRBUF_POISON;
+}
+
+/* Occurrence count over the WHOLE buffer, not just over the part the record chain describes.
+ * A caller is free to ignore the length getdents64 returned and search the bytes itself, so a
+ * name that is only gone from the CHAIN is not hidden.  That is how the module used to drop an
+ * entry: it compacted the chain and left the dropped record's bytes - the whole name, its
+ * d_ino and its d_off - in the tail it no longer described, which is invisible to the record
+ * walk below (it stops at n) and visible to this counter.
+ *
+ * A match only counts at a name boundary: the byte before it must not be a name character.
+ * What precedes a record's own d_name is the buffer start, the d_type byte (0..15), the HIGH
+ * byte of d_reclen in the 32-bit layout (the name field starts at offset 10 and a record stays
+ * under 269 bytes, so that byte is 0x00 or 0x01), or a placeholder's zeroed name[0].  None of
+ * them is a name character, so this drops the "inside a longer name" false positives without
+ * hiding a record the module left behind.  A plain NUL test would be wrong here: at
+ * reclen >= 256 that byte is 0x01, not NUL, and the hit would be missed. */
 static u32 scan_raw(const char *buf, long n, const char *needle)
 {
 	u32 hits = 0;
@@ -249,6 +279,8 @@ static u32 scan_raw(const char *buf, long n, const char *needle)
 	while (needle[nl])
 		nl++;
 	for (i = 0; i + nl <= n; i++) {
+		if (i && is_name_byte((unsigned char)buf[i - 1]))
+			continue;
 		for (k = 0; k < nl; k++)
 			if (buf[i + k] != needle[k])
 				break;
@@ -267,18 +299,24 @@ static u32 scan_dir(long fd, int compat, const char *needle, u32 *entries,
 	*entries = 0;
 	*raw_hits = 0;
 	*tail_hits = 0;
-	while ((n = sys4(compat ? __NR_getdents : __NR_getdents64,
-			 fd, (long)dirbuf, DIRBUF, 0)) > 0) {
+	for (;;) {
 		long off = 0;
 
-		/* Both raw counts describe the chunk the kernel just filled ([0, n)), never the
-		 * stale bytes a shorter read left behind.  `tail_hits` looks for the name without
+		poison_dirbuf();
+		n = sys4(compat ? __NR_getdents : __NR_getdents64,
+			 fd, (long)dirbuf, DIRBUF, 0);
+		if (n <= 0)
+			break;
+
+		/* Both raw counts cover the WHOLE buffer, not [0, n): n is the length the module
+		 * chose to report, and the bytes it no longer describes - where a dropped record
+		 * survives - are exactly the ones past n.  `tail_hits` looks for the name without
 		 * its first byte: the all-hidden placeholder zeroes name[0], and "susfs_kstat"
 		 * then sits in the buffer as "usfs_kstat" - a name the full-needle search cannot
 		 * see. */
-		*raw_hits += scan_raw(dirbuf, n, needle);
+		*raw_hits += scan_raw(dirbuf, DIRBUF, needle);
 		if (needle && needle[0])
-			*tail_hits += scan_raw(dirbuf, n, needle + 1);
+			*tail_hits += scan_raw(dirbuf, DIRBUF, needle + 1);
 
 		while (off < n) {
 			u32 reclen, nameoff;
@@ -313,9 +351,12 @@ static u32 scan_dir(long fd, int compat, const char *needle, u32 *entries,
 /* What one chunk tells a caller, at four levels of trust in the returned length:
  *   entries     - records the chain describes (what a readdir() loop walks)
  *   needle_hits - times the needle appears as a complete record name in that chain
- *   raw_hits    - times the needle appears anywhere in the chunk the kernel filled,
- *                 including the bytes the chain stopped describing: a process that ignores
- *                 the returned length reads the hidden names back here
+ *   raw_hits    - times the needle appears at the START of a name anywhere in the buffer,
+ *                 including the bytes past the returned length (the buffer is poisoned before
+ *                 each read, so what is counted is this read's bytes): a process that ignores
+ *                 the length, or scans the buffer for names, reads the hidden name back here.
+ *                 A visible name that merely contains the needle is not counted; one that
+ *                 starts with it still is (a false positive in the safe direction)
  *   tail_hits   - times the needle without its first byte appears in the same bytes, which
  *                 is all that a placeholder zeroing name[0] leaves of it
  * A hidden entry must score 0 on the last three; only then is it gone from the buffer and

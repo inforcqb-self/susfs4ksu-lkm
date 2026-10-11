@@ -1200,8 +1200,10 @@ static void sus_path_hooks_arm(void)
  * so a process that ignores that length (or scans the whole buffer for names, which the
  * module's own test tooling does) would still read a dropped name out of the bytes the chain
  * no longer covers.  The tail past the compacted chain - and the tail of the placeholder
- * record's name - is therefore zeroed before returning, so no hidden byte survives in the
- * caller's buffer. */
+ * record's name - is therefore zeroed before returning.  The one path left unscubbed is a
+ * scrub that itself fails (uaccess); it is counted and logged, and the chunk is still handed
+ * back as the compacted chain, so a caller that honours the returned length never parses the
+ * bytes that stayed behind. */
 static long sus_path_filter(unsigned long buf, long count,
                             const struct sus_dirent_layout *lay)
 {
@@ -1336,13 +1338,19 @@ static long sus_path_filter(unsigned long buf, long count,
          * (d_off, d_reclen, d_type and the name's tail - zeroing name[0] alone leaves the rest
          * of "susfs_kstat" sitting there as "usfs_kstat"), and every record behind it, is
          * cleared.  The hidden name has to be gone from the buffer, not merely invisible to a
-         * caller that honours the returned length. */
+         * caller that honours the returned length.
+         *
+         * The two scrubs run BEFORE d_ino and name[0] are overwritten: if one of them fails,
+         * the buffer still holds the untouched original chain and the `return count` below is
+         * honest ("nothing was filtered").  Writing the placeholder first would hand the
+         * caller a chain whose first record is already a placeholder - bytes nothing can
+         * parse, which is what this function exists to avoid. */
         if (head_reclen >= lay->name_off + 1 && head_reclen <= count &&
-            !copy_to_user((void __user *)buf, zero_ino, lay->ino_size) &&
-            !copy_to_user((void __user *)(buf + lay->name_off), &nul, 1) &&
             !clear_user((void __user *)(buf + lay->name_off + 1),
                         head_reclen - lay->name_off - 1) &&
-            !clear_user((void __user *)(buf + head_reclen), count - head_reclen)) {
+            !clear_user((void __user *)(buf + head_reclen), count - head_reclen) &&
+            !copy_to_user((void __user *)buf, zero_ino, lay->ino_size) &&
+            !copy_to_user((void __user *)(buf + lay->name_off), &nul, 1)) {
             atomic_inc(&n_dirent_all_hidden);
             return head_reclen;
         }
@@ -1357,15 +1365,15 @@ static long sus_path_filter(unsigned long buf, long count,
      * Whoever ignores the return value, or scans the buffer for names instead of walking it,
      * reads a hidden name (and its d_ino/d_off) straight out of that tail.  Zero it.  This runs
      * with the spinlock released and faults enabled, so a tail whose pages are not resident is
-     * still scrubbed rather than left behind. */
-    if (!failed && written < count &&
-        clear_user((void __user *)(buf + written), count - written)) {
-        /* A partially scrubbed tail still carries hidden names, so this chunk cannot be handed
-         * back as filtered: report it as untouched instead. */
+     * still scrubbed rather than left behind.
+     *
+     * A chain that stopped early (failed) leaves just as much of a dropped record behind as a
+     * complete one, so this runs on that path too; the return value stays `written` either way,
+     * because that is what still describes the bytes the caller may parse. */
+    if (written < count && clear_user((void __user *)(buf + written), count - written)) {
         atomic_inc(&n_dirent_rewrite_fail);
-        pr_warn_ratelimited("sus_path: dirent tail scrub stopped at %ld/%ld bytes (returned %ld)\n",
-                            written, count, count);
-        return count;
+        pr_warn_ratelimited("sus_path: dirent tail scrub stopped at %ld/%ld bytes (%ld bytes of stale records stay in the buffer)\n",
+                            written, count, count - written);
     }
 
     return written;
