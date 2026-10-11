@@ -1211,6 +1211,7 @@ static long sus_path_filter(unsigned long buf, long count,
     long written = 0;       /* bytes of the compacted chain already handed back */
     unsigned short head_reclen = 0;     /* first record's length, for the placeholder */
     bool failed = false;
+    bool counted = false;   /* this chunk was already counted as a rewrite failure */
     char *tmp;
 
     spin_lock(&sus_path_buf_lock);
@@ -1316,6 +1317,7 @@ static long sus_path_filter(unsigned long buf, long count,
 
     if (failed) {
         atomic_inc(&n_dirent_rewrite_fail);
+        counted = true;
         pr_warn_ratelimited("sus_path: dirent rewrite stopped at %ld/%ld bytes (returned %ld)\n",
                             offset, count, written ? written : count);
         if (!written)
@@ -1340,11 +1342,12 @@ static long sus_path_filter(unsigned long buf, long count,
          * cleared.  The hidden name has to be gone from the buffer, not merely invisible to a
          * caller that honours the returned length.
          *
-         * The two scrubs run BEFORE d_ino and name[0] are overwritten: if one of them fails,
-         * the buffer still holds the untouched original chain and the `return count` below is
-         * honest ("nothing was filtered").  Writing the placeholder first would hand the
-         * caller a chain whose first record is already a placeholder - bytes nothing can
-         * parse, which is what this function exists to avoid. */
+         * The two scrubs run BEFORE d_ino and name[0] are overwritten, so a failure leaves the
+         * chain itself intact and the `return count` below is honest ("nothing was filtered").
+         * A scrub stopped by a fault can only have zeroed bytes from name[0]'s tail onward -
+         * inside the first record, never its header - so what the caller gets is still a
+         * parseable chain; writing the placeholder first would instead hand it a chain whose
+         * first record is already a placeholder, bytes nothing can parse. */
         if (head_reclen >= lay->name_off + 1 && head_reclen <= count &&
             !clear_user((void __user *)(buf + lay->name_off + 1),
                         head_reclen - lay->name_off - 1) &&
@@ -1371,7 +1374,8 @@ static long sus_path_filter(unsigned long buf, long count,
      * complete one, so this runs on that path too; the return value stays `written` either way,
      * because that is what still describes the bytes the caller may parse. */
     if (written < count && clear_user((void __user *)(buf + written), count - written)) {
-        atomic_inc(&n_dirent_rewrite_fail);
+        if (!counted)       /* one failure event, one count */
+            atomic_inc(&n_dirent_rewrite_fail);
         pr_warn_ratelimited("sus_path: dirent tail scrub stopped at %ld/%ld bytes (%ld bytes of stale records stay in the buffer)\n",
                             written, count, count - written);
     }
