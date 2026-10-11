@@ -1,0 +1,58 @@
+name: codeql-cpp
+
+# C/C++ only.  This has to be an advanced setup: the module is not built by any of CodeQL's own
+# options - `none` analyses the sources without a compiler (kernel headers and macros then resolve
+# badly, which is noise rather than coverage), and `autobuild` runs a plain `make` that cannot find
+# this tree's DDK toolchain.  The compile that CodeQL traces here is the same one build-ddk.yml runs,
+# in the same image, so the database describes the code as it is actually built.
+#
+# Python and Actions stay on the repository's default setup (they need no build).
+#
+# No pull_request trigger on purpose: on a fork PR the workflow has no `security-events: write`, so
+# the upload step would fail through no fault of the change.  The push to main/dev covers what
+# matters, and workflow_dispatch is there for a manual run.
+
+on:
+  push:
+    branches: [main, dev]
+    paths-ignore:
+      - "**.md"
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+jobs:
+  analyze-c-cpp:
+    name: Analyze (c-cpp)
+    runs-on: ubuntu-latest
+    container:
+      # Same DDK image the release build uses, for one variant only: CodeQL needs one compile of the
+      # module, and 5.15 (LLVM CFI) is the variant this device runs.
+      image: ghcr.io/ylarod/ddk-min:android13-5.15-20260828
+      options: --privileged
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          build-mode: manual
+
+      # The same command build-ddk.yml uses (one line: this Makefile's own comment explains why the
+      # trailing-continuation form silently lost ARCH/CC/LLVM and the `modules` target).
+      - name: Build susfs_guard_lkm.ko (traced)
+        run: |
+          set -e
+          make -k -C "$KDIR" M="$PWD/kernel" ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules -j"$(nproc)"
+          ls -la kernel/susfs_guard_lkm.ko
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:c-cpp"
