@@ -1,0 +1,158 @@
+name: gitee-release
+
+# Publishes a GitHub release's ASSETS to Gitee as a release of its own.  The Gitee
+# repository is NOT a source mirror: what a reader in China needs there is the build
+# output - the eight .ko files and the loader - not a second copy of the tree.
+#
+# Run by hand only (workflow_dispatch).  Two reasons: publishing must not race a release
+# whose assets are still being uploaded, and the source cleanup below is destructive - it
+# should be a deliberate act, never a side effect of publishing.
+#
+# Inputs
+#   tag            GitHub release tag to publish (default: the latest release)
+#   purge_source   once, to take the old source mirror down: force Gitee's default branch
+#                  to a single EMPTY commit (no source tree at all) and delete every other
+#                  branch.  Tags are kept on purpose - a Gitee release has to hang off one,
+#                  and a tag whose commit is an empty tree hands out no source.  New tags
+#                  for later releases are created against that empty branch, so this stays
+#                  true for every release after the purge.
+#
+# Configuration, once, in this repository's settings (never in this file):
+#   secret   GITEE_TOKEN  a Gitee personal access token with the `projects` scope
+#   variable GITEE_REPO   owner/name on gitee.com, e.g. "someone/susfs4ksu-lkm"
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "GitHub release tag to publish to Gitee (default: the latest release)"
+        required: false
+        default: ""
+      purge_source:
+        description: "Delete the source mirror on Gitee: default branch becomes one empty commit, all other branches are removed (tags stay)"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: gitee-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+      GITEE_REPO: ${{ vars.GITEE_REPO }}
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      PURGE: ${{ inputs.purge_source }}
+    steps:
+      - name: Check configuration
+        run: |
+          set -euo pipefail
+          if [ -z "${GITEE_TOKEN}" ]; then
+            echo "GITEE_TOKEN is not configured - nothing is published (see this workflow's header)"
+            echo "SKIP=1" >> "$GITHUB_ENV"
+          fi
+          if [ -z "${GITEE_REPO}" ]; then
+            echo "::error::GITEE_REPO is not configured - set it to owner/name on gitee.com"
+            exit 1
+          fi
+          if [ -z "${TAG}" ]; then
+            echo "no tag given - using the latest release"
+            echo "TAG=$(gh release view --repo ${GITHUB_REPOSITORY} --json tagName -q .tagName)" >> "$GITHUB_ENV"
+          fi
+
+      # Destructive and off by default: it is here (rather than as a one-off script) so that
+      # what was done to the far side is reviewable in the run log, and repeatable if a
+      # mirror ever comes back.
+      - name: Purge the source mirror on Gitee
+        if: env.SKIP != '1' && env.PURGE == 'true'
+        run: |
+          set -euo pipefail
+          api="https://gitee.com/api/v5/repos/${GITEE_REPO}"
+          owner="${GITEE_REPO%%/*}"
+
+          echo "--- branches before ---"
+          curl -sf "${api}/branches?access_token=${GITEE_TOKEN}" | jq -r '.[].name'
+
+          work=$(mktemp -d)
+          cd "$work"
+          git init -q .
+          git config user.name "gitee-release"
+          git config user.email "gitee-release@users.noreply.github.com"
+          # An empty tree, not an empty file: the point is that no source can be fetched.
+          git commit -q --allow-empty -m "release-only repository: build assets are in Releases, source is on GitHub"
+          git push -q --force "https://${owner}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git" HEAD:refs/heads/main
+
+          # Every other branch goes.  The default one stays because a tag (and therefore a
+          # release) needs a commit that exists here - see this workflow's header.
+          for b in $(curl -sf "${api}/branches?access_token=${GITEE_TOKEN}" | jq -r '.[].name'); do
+            if [ "$b" = "main" ]; then continue; fi
+            echo "deleting branch ${b}"
+            curl -sf -X DELETE "${api}/branches/${b}?access_token=${GITEE_TOKEN}" >/dev/null
+          done
+
+          echo "--- branches after ---"
+          curl -sf "${api}/branches?access_token=${GITEE_TOKEN}" | jq -r '.[].name'
+
+      - name: Download the release assets
+        if: env.SKIP != '1'
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir assets --clobber
+          ls -la assets
+
+      - name: Create (or find) the Gitee release
+        if: env.SKIP != '1'
+        id: rel
+        env:
+          GITEE_REPO: ${{ vars.GITEE_REPO }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -euo pipefail
+          api="https://gitee.com/api/v5/repos/${GITEE_REPO}"
+
+          body=$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json body -q .body || echo "")
+          name=$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json name -q .name || echo "${TAG}")
+
+          # Gitee creates the tag here if it does not exist yet, off target_commitish.  That
+          # branch is the single empty commit the purge leaves behind, so a tag made this way
+          # points at no source.  A failure to create it is a real error: publishing assets
+          # against a tag the far side does not have would hand out a release nobody can
+          # anchor.
+          id=$(curl -sf -X POST -H "Content-Type: application/json" \
+                 -d "$(jq -nc --arg t "$TAG" --arg n "$name" --arg b "$body" \
+                        '{access_token: $token, tag_name: $t, name: $n, body: $b, target_commitish: "main", prerelease: false}' \
+                        --arg token "$GITEE_TOKEN")" \
+                 "${api}/releases" | jq -r '.id' || true)
+
+          if [ -z "$id" ] || [ "$id" = "null" ]; then
+            echo "release for ${TAG} already exists on Gitee - reusing it"
+            id=$(curl -sf "${api}/releases/tags/${TAG}?access_token=${GITEE_TOKEN}" | jq -r '.id')
+          fi
+          echo "release id: ${id}"
+          echo "id=${id}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the assets
+        if: env.SKIP != '1'
+        env:
+          GITEE_REPO: ${{ vars.GITEE_REPO }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -euo pipefail
+          api="https://gitee.com/api/v5/repos/${GITEE_REPO}"
+          id="${{ steps.rel.outputs.id }}"
+
+          for f in assets/*; do
+            echo "uploading $(basename "$f") ($(stat -c%s "$f") bytes)"
+            curl -sf -X POST "${api}/releases/${id}/attach_files?access_token=${GITEE_TOKEN}" \
+                 -F "file=@$f" -o /dev/null
+          done
+
+          echo "--- the release as Gitee sees it ---"
+          curl -sf "${api}/releases/tags/${TAG}?access_token=${GITEE_TOKEN}" | jq -r '.assets[]? | "\(.name) \(.size)"'
