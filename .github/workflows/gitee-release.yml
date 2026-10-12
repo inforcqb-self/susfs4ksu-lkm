@@ -88,13 +88,23 @@ jobs:
           git commit -q --allow-empty -m "release-only repository: build assets are in Releases, source is on GitHub"
           git push -q --force "https://${owner}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git" HEAD:refs/heads/main
 
-          # Every other branch goes.  The default one stays because a tag (and therefore a
-          # release) needs a commit that exists here - see this workflow's header.
+          # Every other branch goes.  Deleted through git and not through the REST API: the
+          # first run of this workflow had the push above succeed over this same token and
+          # then `DELETE /branches/dev` come back as curl error 22, so the API route is not
+          # the one that works here.  Full refs are used because a branch name with a slash
+          # in it (fix/...) is otherwise ambiguous against a tag of the same name.
+          refs=""
           for b in $(curl -sf "${api}/branches?access_token=${GITEE_TOKEN}" | jq -r '.[].name'); do
             if [ "$b" = "main" ]; then continue; fi
-            echo "deleting branch ${b}"
-            curl -sf -X DELETE "${api}/branches/${b}?access_token=${GITEE_TOKEN}" >/dev/null
+            refs="${refs} refs/heads/${b}"
           done
+          if [ -n "${refs}" ]; then
+            # shellcheck disable=SC2086
+            git push -q "https://${owner}:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git" --delete ${refs}
+            echo "deleted:${refs}"
+          else
+            echo "no branches to delete"
+          fi
 
           echo "--- branches after ---"
           curl -sf "${api}/branches?access_token=${GITEE_TOKEN}" | jq -r '.[].name'
