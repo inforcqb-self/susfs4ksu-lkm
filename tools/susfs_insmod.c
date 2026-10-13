@@ -27,7 +27,10 @@
  *   1. map the .ko MAP_PRIVATE|PROT_WRITE (writes stay in this process' memory);
  *   2. walk .symtab: for every SHN_UNDEF entry with a non-empty name, look the name
  *      up in /proc/kallsyms and rewrite that Elf64_Sym in place to
- *      st_shndx = SHN_ABS, st_value = <address> (last kallsyms occurrence wins);
+ *      st_shndx = SHN_ABS, st_value = <address> (last kallsyms occurrence wins).
+ *      Only the kernel's own symbols are eligible: a record followed by " [module]"
+ *      is skipped whole, because its address belongs to another module's image, and
+ *      the same name there can mean something unrelated to what we linked against;
  *   3. init_module(2) the patched buffer with the joined module parameters;
  *   4. if that fails and /dev/kmsg says the vermagic is wrong, patch the .modinfo
  *      "vermagic=" value in place and retry once.
@@ -430,6 +433,7 @@ static u64 ks_zero;		/* records whose address printed as 0 */
 static u64 ks_addr;		/* records with a real address (any type) */
 static u64 ks_dotted;		/* names with a '.' - not matchable by this tool */
 static u64 ks_abs_type;		/* type a/A: absolute symbols, not addresses */
+static u64 ks_module;		/* module symbols: another module's image, not the kernel's */
 
 /* Save kptr_restrict and set it to 0, the way ksud does (it writes 1; root sees
  * real addresses at both values, the kernel's kallsyms_show_value() falls through
@@ -533,11 +537,16 @@ static void ks_record(const char *s, u64 len, u32 *matched, u32 *zero_addr)
 	while (nlen && (s[i + nlen - 1] == ' ' || s[i + nlen - 1] == '\t' ||
 			s[i + nlen - 1] == '\r'))
 		nlen--;
-	/* A module symbol is followed by " [module]"; the name ends at the space. */
+	/* kallsyms prints its own symbols first and the module ones after them, and a module
+	 * record carries a fourth field: " [module]".  That address lives in another module's
+	 * image, so adopting it would resolve our import to a stranger's symbol - same name,
+	 * unrelated meaning - and the load would succeed into the wrong thing instead of
+	 * failing.  Only the kernel's symbols are ours to take, which is where ksud's walk
+	 * ends too (it stops at the first module record). */
 	for (j = 0; j < nlen; j++) {
 		if (s[i + j] == ' ' || s[i + j] == '\t') {
-			nlen = j;
-			break;
+			ks_module++;
+			return;
 		}
 	}
 	if (!nlen)
@@ -996,7 +1005,9 @@ void insmod_main(long argc, char **argv)
 			o_dec(ks_abs_type);
 			o_put(" absolute (a/A, skipped), ");
 			o_dec(ks_dotted);
-			o_put(" dotted names (skipped)\n");
+			o_put(" dotted names (skipped), ");
+			o_dec(ks_module);
+			o_put(" module symbols (skipped)\n");
 			o_flush();
 		}
 

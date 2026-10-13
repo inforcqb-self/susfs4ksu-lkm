@@ -738,6 +738,14 @@ jobs:
           file /tmp/susfs_insmod
           ls -la /tmp/susfs_insmod
 
+      # The rule about which kallsyms record a name may come from is tested on the runner:
+      # no kernel and no device needed.
+      - name: Match-rule test (host)
+        run: |
+          set -e
+          cc -O1 -o /tmp/insmod_match_test tools/insmod_match_test.c
+          /tmp/insmod_match_test
+
       - name: Upload module loader
         continue-on-error: true
         uses: actions/upload-artifact@v4
