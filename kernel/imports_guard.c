@@ -104,7 +104,6 @@ static const struct susfs_import susfs_imports[] = {
     IMP(copy_to_kernel_nofault),
     IMP(security_secctx_to_secid),
     IMP(stop_machine),
-    IMP_DATA(__tracepoint_sys_exit),
     IMP(tracepoint_probe_register),
     IMP(tracepoint_probe_unregister),
     IMP(register_kprobe),

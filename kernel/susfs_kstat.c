@@ -18,9 +18,10 @@
  *
  * Hook strategy (LTO on this GKI inlines the stat chain vfs_fstatat -> vfs_statx -> vfs_getattr ->
  * cp_new_stat, so VFS-layer kprobes miss): the reliable hook is the RETURN of the stat syscall,
- * where the user statbuf is fully written - caught on the ONE global sys_exit tracepoint
- * (kstat_sys_exit()), which whitelists the numbers PER CALLER ABI and rewrites the requested fields
- * of the user buffer there via copy_to_user.  Native: newfstatat(79), fstat(80), statx(291).
+ * where the user statbuf is fully written - so this layer replaces the sys_call_table entries of
+ * the numbers below and rewrites the requested fields of the user buffer in the wrapper's tail,
+ * once the original has returned (see kstat_hooks[] and susfs_kstat_post()).  Native:
+ * newfstatat(79), fstat(80), statx(291).
  * AArch32: fstatat64(327), stat64(195), lstat64(196), fstat64(197) -> struct stat64; stat(106),
  * lstat(107), fstat(108) -> struct compat_stat; statx(397) -> the SAME struct statx as native
  * (unistd32.h maps 397 to the native statx body, and struct statx is a fixed-width uapi struct, so
@@ -51,7 +52,8 @@
 #include <linux/version.h>	/* LINUX_VERSION_CODE: the inode ctime accessor */
 #include "susfs_abi.h"
 #include "susfs_log.h"
-#include "susfs.h"	/* susfs_expose_proc, sus_path_dirent_filter() */
+#include "susfs.h"	/* susfs_expose_proc, sus_path_dirent_filter(), SUS_NR_GETDENTS*_COMPAT */
+#include "susfs_fp_hook.h"	/* struct susfs_fp_hook + install/remove/drain: the table entries */
 #include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 #include "susfs_kprobe.h"
 
@@ -95,7 +97,7 @@ static DEFINE_MUTEX(kstat_lock);
 
 /* Table locking, in two tiers.  kstat_lock (mutex) serialises WRITERS and the /proc read, because
  * writers resolve paths and that sleeps.  kstat_table_lock (spinlock) guards the table for the
- * READERS - the sys_exit tracepoint and the show_map_vma kretprobe, hot paths where kstat_lock
+ * READERS - the stat layer's entry tail and the show_map_vma kretprobe, hot paths where kstat_lock
  * cannot be taken; a reader holds it only long enough to copy the matching entry out and must never
  * copy_to_user under it.  Rule: resolve first (sleeping, outside), then swap (non-sleeping, inside) -
  * publishing a slot before it is filled is a bug (an empty slot used to be visible as soon as nkstat
@@ -184,7 +186,7 @@ static bool susfs_kstat_gate_ok(void)
  * kstat_table_lock; their callers hold kstat_lock, making the index they pass stable. */
 
 /* Cheapest possible gate for the READ paths: with nothing registered no lookup can match, which on
- * the sys_exit tracepoint saves the two copy_from_user() reads the spoofers do before matching, and
+ * the stat layer's entry tail saves the two copy_from_user() reads the spoofers do before matching, and
  * on the show_map_vma kprobe (still armed after a `clear`) saves an uncontended spinlock per VMA
  * (the vfs_getattr kretprobe this sentence used to name is gone - see the note above struct
  * kstat_call_counters).
@@ -514,7 +516,7 @@ static void kstat_maps_disarm(void)
  * What this hook structurally CANNOT cover: anything that fills a statbuf without going through a
  * user syscall exit.  io_uring's IORING_OP_STATX / IORING_OP_FSTAT call vfs_statx() from a worker
  * or from io_uring_enter, so the LSM layer (sus_path's inode_getattr slot) still answers ENOENT for
- * a hidden file, but there is no sys_exit to rewrite and the caller sees the REAL numbers - see
+ * a hidden file, but there is no wrapper tail to rewrite it and the caller sees the REAL numbers - see
  * COVERAGE.md's io_uring row.  The same is true of an in-kernel caller of vfs_getattr. */
 struct kstat_call_counters {
 	atomic_t calls;		/* this number returned 0: it reached the statbuf code */
@@ -1371,32 +1373,39 @@ static bool susfs_kstat_spoof_statx(struct kstat_call_state *st, unsigned long s
 	return true;
 }
 
-/* sys_exit tracepoint: the user statbuf is fully written by now, and syscall_get_arguments()
- * still returns the original args (verified: args[2] == statbuf), so no per-cpu state is needed.
+/* The post-check, called at the TAIL of the table-entry wrapper (see kstat_hooks[] below) instead
+ * of from a entry tail.  Two features ride it, exactly as before: the stat family below,
+ * and sus_path's directory-listing rewrite.  The listing side still needs its own gate - see the
+ * note above sus_path_dirent_layout_id(): a syscall number alone does not identify a call (arm64's
+ * native 141 is getpriority where AArch32 numbers getdents 141), so the number is only ever read
+ * together with the caller's ABI - and here the ABI is not a guess, it is which table the wrapper
+ * was installed in.
  *
- * It carries two features: the stat family below, and sus_path's directory-listing rewrite.  The
- * listing side needs its own gate - see the note above sus_path_dirent_layout_id(): a syscall
- * number alone does not identify a call (arm64's native 141 is getpriority where AArch32 numbers
- * getdents 141), so the number is only ever read together with the caller's ABI.
+ * WHAT CHANGED, AND WHY.  As a tracepoint this ran for EVERY syscall exit, so is_compat_task(),
+ * syscall_get_nr() and the two classifiers below were paid on all of them - measured at ~28 ns per
+ * syscall when the stat family moved onto it (getpid 113 -> 141 ns), and re-measured at the time of
+ * this change as 126 ns without the tracepoint vs 151 ns with it (three runs each, +25..31 ns), on
+ * the same device the module ships to.  As a wrapper tail it runs only for the thirteen numbers in
+ * kstat_hooks[], and both the "which ABI" and the "which syscall" questions are answered by which
+ * table entry was called rather than by a test that every syscall has to pay for.  Nothing is lost:
+ * the arguments arrive from the wrapper, which copies them out of regs BEFORE calling the original
+ * (a syscall's return value lands in regs->regs[0], so reading them afterwards would hand the
+ * spoofers the return value in place of the first argument).
  *
- * COST: this callback runs for every syscall exit, so the three checks below (is_compat_task(),
- * syscall_get_nr(), the classifier) are paid on all of them - a function call and a couple of
- * compares.  The callback itself was measured when the stat family moved onto it at ~28 ns per
- * syscall (getpid 113 -> 141 ns); that number is the baseline this adds to, and it has not been
- * re-measured for the listing filter (no device was available for this change).
+ * The old KNOWN BOUNDARY (ptrace) went away with the tracepoint: arch/arm64/kernel/syscall.c
+ * writes regs->syscallno = scno before syscall_trace_enter(), so a tracer that rewrote a getdents64
+ * into another syscall was still classified as getdents64 here.  A tracer cannot rewrite which
+ * table entry the kernel calls, so this dispatch is on what was really called.
  *
- * KNOWN BOUNDARY (ptrace): arch/arm64/kernel/syscall.c writes regs->syscallno = scno BEFORE
- * syscall_trace_enter(), so a tracer that rewrites a getdents64 into another syscall still gets
- * classified here as getdents64; the parse then fails on a buffer that is not a dirent chain and
- * counts a rewrite failure.  It cannot corrupt anything (every read is bounded by d_reclen and
- * every failure answers "nothing filtered"), and the stat family below has the same exposure. */
-static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
+ * `out` is the wrapper's answer and starts at the original's return value: the stat family rewrites
+ * the caller's buffer and leaves the return value alone, while the listing filter shortens the count
+ * and must hand that back - the tracepoint did it with syscall_set_return_value(), which a wrapper
+ * has no regs to do it with. */
+static __nocfi void susfs_kstat_post(long nr, bool compat, const unsigned long *args,
+				     long ret, long *out)
 {
-	unsigned long args[6];
 	struct kstat_call_counters *c;
 	struct kstat_call_state st;
-	long nr = syscall_get_nr(current, regs);
-	bool compat = is_compat_task();
 	int lay = sus_path_dirent_layout_id(nr, compat);
 
 	if (lay >= 0) {
@@ -1417,13 +1426,13 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 			sus_path_dirent_filter(lay, 0, ret);
 			return;
 		}
-		syscall_get_arguments(current, regs, args);
+		/* The arguments come from the wrapper now - see the note above. */
 		rc = sus_path_dirent_filter(lay,
 					    compat ? (unsigned long)compat_ptr((u32)args[1])
 						   : args[1],
 					    ret);
 		if (rc != ret)
-			syscall_set_return_value(current, regs, 0, rc);
+			*out = rc;
 		return;
 	}
 
@@ -1508,7 +1517,7 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 	 * no gate of its own. */
 	switch (nr) {
 	case __NR_newfstatat:
-		syscall_get_arguments(current, regs, args);
+		/* The arguments come from the wrapper now - see the note above. */
 		if (!args[2]) {
 			atomic_inc(&c->no_buf);
 			return;
@@ -1516,7 +1525,7 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 		susfs_kstat_spoof_statbuf(&st, args[2]);
 		return;
 	case __NR_fstat:
-		syscall_get_arguments(current, regs, args);
+		/* The arguments come from the wrapper now - see the note above. */
 		if (!args[1]) {
 			atomic_inc(&c->no_buf);
 			return;
@@ -1526,7 +1535,7 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 	case __NR_statx:
 	case COMPAT_STATX_NR:	/* 397 IS the native statx body: same buffer, same mask, 32-bit ptr */
 
-		syscall_get_arguments(current, regs, args);
+		/* The arguments come from the wrapper now - see the note above. */
 		if (!args[4]) {
 			atomic_inc(&c->no_buf);
 			return;
@@ -1537,7 +1546,7 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 		return;
 	case COMPAT_FSTATAT64_NR:
 
-		syscall_get_arguments(current, regs, args);
+		/* The arguments come from the wrapper now - see the note above. */
 		if (!args[2]) {
 			atomic_inc(&c->no_buf);
 			return;
@@ -1548,7 +1557,7 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 	case COMPAT_LSTAT64_NR:
 	case COMPAT_FSTAT64_NR:
 
-		syscall_get_arguments(current, regs, args);
+		/* The arguments come from the wrapper now - see the note above. */
 		if (!args[1]) {
 			atomic_inc(&c->no_buf);
 			return;
@@ -1563,7 +1572,7 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 		 * args[1] in all three (fs/stat.c: COMPAT_SYSCALL_DEFINE2(newstat, filename,
 		 * statbuf) and DEFINE2(newfstat, fd, statbuf)).  struct compat_stat, so the
 		 * write-back is susfs_kstat_spoof_compat_stat(), not the one above. */
-		syscall_get_arguments(current, regs, args);
+		/* The arguments come from the wrapper now - see the note above. */
 		if (!args[1]) {
 			atomic_inc(&c->no_buf);
 			return;
@@ -1572,6 +1581,138 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 		return;
 	}
 }
+
+/* ==== the sys_call_table entries that drive the post-check above ==== */
+/*
+ * This is what replaced the stat layer's table entries.  Thirteen entries, one per (number, ABI)
+ * pair, because the two questions that tracepoint had to answer on EVERY syscall - "which ABI is
+ * the caller" and "which number is this" - are both answered here by which entry was called: a
+ * 32-bit task never reaches sys_call_table, and the compat table does not share its numbering with
+ * the native one (AArch32 141 is getdents where arm64's 141 is getpriority; its 195/196/197 are
+ * stat64/lstat64/fstat64 where the native ones are shmctl/shmat/shmdt).
+ *
+ * WHY IT MOVED.  As a tracepoint the callback ran on every syscall exit and paid
+ * is_compat_task(), syscall_get_nr() and two classifiers for all of them.  Measured on the device
+ * before this change, on the getpid line of susfs_bench (no entry of ours is involved there, so it
+ * is the cost of whatever fires on every syscall):
+ *
+ *     kstat layer forced off (fail_layer=6)   126 / 126 / 126 ns   <- no tracepoint
+ *     everything armed                        151 / 150 / 151 ns   <- tracepoint registered
+ *
+ * i.e. +25..31 ns per syscall, on every syscall, whether or not it is one this module cares about.
+ * Now only these thirteen numbers pay anything, and both classifiers went away with the tracepoint.
+ *
+ * Arguments are copied out of regs BEFORE the original runs: a syscall's return value is written
+ * into regs->regs[0] (arch/arm64/kernel/syscall.c, and the compat entry point does the same), so
+ * reading them afterwards would hand the spoofers the return value in place of the first argument.
+ *
+ * __nocfi is mandatory on the wrapper, for the reason susfs_opath.c states at length: it is reached
+ * by an indirect call out of the kernel's table, and it calls the original the same way.  The NULL
+ * test on the slot is not about publish order - susfs_fp_install() publishes the original before it
+ * writes the table - it is what turns a future mistake there into one failed syscall instead of a
+ * jump to address 0.
+ *
+ * nr < 0 means "this number exists in the compat table only" (struct susfs_fp_hook spells that
+ * out); every AArch32 entry below is one of those, because its native namesake is a different
+ * syscall.  The .sym fields are for the diagnostic dump only - susfs_fp_dump_entry() resolves them
+ * by name - so one that does not match what this kernel calls the entry shows up as "no symbol"
+ * there and changes nothing about the hook itself.
+ */
+static susfs_syscall_fn_t kstat_orig_nfstatat;
+static susfs_syscall_fn_t kstat_orig_fstat;
+static susfs_syscall_fn_t kstat_orig_statx;
+static susfs_syscall_fn_t kstat_orig_getdents64;
+static susfs_syscall_fn_t kstat_orig_compat_stat64;
+static susfs_syscall_fn_t kstat_orig_compat_lstat64;
+static susfs_syscall_fn_t kstat_orig_compat_fstat64;
+static susfs_syscall_fn_t kstat_orig_compat_fstatat64;
+static susfs_syscall_fn_t kstat_orig_compat_stat;
+static susfs_syscall_fn_t kstat_orig_compat_lstat;
+static susfs_syscall_fn_t kstat_orig_compat_fstat;
+static susfs_syscall_fn_t kstat_orig_compat_statx;
+static susfs_syscall_fn_t kstat_orig_compat_getdents64;
+static susfs_syscall_fn_t kstat_orig_compat_getdents;
+
+#define SUSFS_KSTAT_WRAPPER(fn, slot, nrval, combat)			\
+	static __nocfi long fn(const struct pt_regs *regs)		\
+	{								\
+		susfs_syscall_fn_t orig = READ_ONCE(slot);		\
+		unsigned long a[6];					\
+		long ret, out;						\
+									\
+		if (!orig)						\
+			return -ENOSYS;					\
+		/* susfs_syscall_fn_t takes a const regs (the table's own type) while	\
+		 * syscall_get_arguments() asks for a non-const one it only reads - the	\
+		 * cast is what that difference costs, and nothing here writes regs. */	\
+		syscall_get_arguments(current, (struct pt_regs *)regs, a);	\
+		ret = orig(regs);					\
+		out = ret;						\
+		susfs_kstat_post(nrval, combat, a, ret, &out);		\
+		return out;						\
+	}
+
+SUSFS_KSTAT_WRAPPER(kstat_wrap_nfstatat, kstat_orig_nfstatat, __NR_newfstatat, false)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_fstat, kstat_orig_fstat, __NR_fstat, false)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_statx, kstat_orig_statx, __NR_statx, false)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_getdents64, kstat_orig_getdents64, __NR_getdents64, false)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_stat64, kstat_orig_compat_stat64, COMPAT_STAT64_NR, true)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_lstat64, kstat_orig_compat_lstat64, COMPAT_LSTAT64_NR, true)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_fstat64, kstat_orig_compat_fstat64, COMPAT_FSTAT64_NR, true)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_fstatat64, kstat_orig_compat_fstatat64, COMPAT_FSTATAT64_NR, true)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_stat, kstat_orig_compat_stat, COMPAT_STAT_NR, true)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_lstat, kstat_orig_compat_lstat, COMPAT_LSTAT_NR, true)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_fstat, kstat_orig_compat_fstat, COMPAT_FSTAT_NR, true)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_statx, kstat_orig_compat_statx, COMPAT_STATX_NR, true)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_getdents64, kstat_orig_compat_getdents64, SUS_NR_GETDENTS64_COMPAT, true)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_getdents, kstat_orig_compat_getdents, SUS_NR_GETDENTS_COMPAT, true)
+
+static struct susfs_fp_hook kstat_hooks[] = {
+	{ .nr = __NR_newfstatat, .nr_compat = 0, .name = "kstat/newfstatat",
+	  .sym = "__arm64_sys_newfstatat",
+	  .wrapper = kstat_wrap_nfstatat, .orig_slot = &kstat_orig_nfstatat },
+	{ .nr = __NR_fstat, .nr_compat = 0, .name = "kstat/fstat",
+	  .sym = "__arm64_sys_fstat",
+	  .wrapper = kstat_wrap_fstat, .orig_slot = &kstat_orig_fstat },
+	{ .nr = __NR_statx, .nr_compat = 0, .name = "kstat/statx",
+	  .sym = "__arm64_sys_statx",
+	  .wrapper = kstat_wrap_statx, .orig_slot = &kstat_orig_statx },
+	{ .nr = __NR_getdents64, .nr_compat = 0, .name = "kstat/getdents64",
+	  .sym = "__arm64_sys_getdents64",
+	  .wrapper = kstat_wrap_getdents64, .orig_slot = &kstat_orig_getdents64 },
+
+	/* The AArch32 half.  nr stays -1 for every one of them. */
+	{ .nr = -1, .nr_compat = COMPAT_STAT64_NR, .name = "kstat/compat stat64",
+	  .sym = "__arm64_compat_sys_stat64",
+	  .wrapper = kstat_wrap_compat_stat64, .orig_slot_compat = &kstat_orig_compat_stat64 },
+	{ .nr = -1, .nr_compat = COMPAT_LSTAT64_NR, .name = "kstat/compat lstat64",
+	  .sym = "__arm64_compat_sys_lstat64",
+	  .wrapper = kstat_wrap_compat_lstat64, .orig_slot_compat = &kstat_orig_compat_lstat64 },
+	{ .nr = -1, .nr_compat = COMPAT_FSTAT64_NR, .name = "kstat/compat fstat64",
+	  .sym = "__arm64_compat_sys_fstat64",
+	  .wrapper = kstat_wrap_compat_fstat64, .orig_slot_compat = &kstat_orig_compat_fstat64 },
+	{ .nr = -1, .nr_compat = COMPAT_FSTATAT64_NR, .name = "kstat/compat fstatat64",
+	  .sym = "__arm64_compat_sys_fstatat64",
+	  .wrapper = kstat_wrap_compat_fstatat64, .orig_slot_compat = &kstat_orig_compat_fstatat64 },
+	{ .nr = -1, .nr_compat = COMPAT_STAT_NR, .name = "kstat/compat stat",
+	  .sym = "__arm64_compat_sys_newstat",
+	  .wrapper = kstat_wrap_compat_stat, .orig_slot_compat = &kstat_orig_compat_stat },
+	{ .nr = -1, .nr_compat = COMPAT_LSTAT_NR, .name = "kstat/compat lstat",
+	  .sym = "__arm64_compat_sys_newlstat",
+	  .wrapper = kstat_wrap_compat_lstat, .orig_slot_compat = &kstat_orig_compat_lstat },
+	{ .nr = -1, .nr_compat = COMPAT_FSTAT_NR, .name = "kstat/compat fstat",
+	  .sym = "__arm64_compat_sys_newfstat",
+	  .wrapper = kstat_wrap_compat_fstat, .orig_slot_compat = &kstat_orig_compat_fstat },
+	{ .nr = -1, .nr_compat = COMPAT_STATX_NR, .name = "kstat/compat statx",
+	  .sym = "__arm64_compat_sys_statx",
+	  .wrapper = kstat_wrap_compat_statx, .orig_slot_compat = &kstat_orig_compat_statx },
+	{ .nr = -1, .nr_compat = SUS_NR_GETDENTS64_COMPAT, .name = "kstat/compat getdents64",
+	  .sym = "__arm64_compat_sys_getdents64",
+	  .wrapper = kstat_wrap_compat_getdents64, .orig_slot_compat = &kstat_orig_compat_getdents64 },
+	{ .nr = -1, .nr_compat = SUS_NR_GETDENTS_COMPAT, .name = "kstat/compat getdents",
+	  .sym = "__arm64_compat_sys_getdents",
+	  .wrapper = kstat_wrap_compat_getdents, .orig_slot_compat = &kstat_orig_compat_getdents },
+};
 
 /* ---- path resolution + rule management (original SUSFS semantics) ---- */
 
@@ -1908,25 +2049,45 @@ static const struct proc_ops kstat_proc_ops = {
 
 static struct proc_dir_entry *kstat_proc_entry;
 
-static bool kstat_tp_registered;
+/* How many of kstat_hooks[] are actually in place: this layer's armed state, and what its log line
+ * reports.  The entry tail that used to be registered here is gone - the entries' comment
+ * above says why and what it cost. */
+static int kstat_hooks_armed;
 
 int susfs_kstat_init(void)
 {
 	int rc;
+	int i;
 
-	/* The hooks are armed UNCONDITIONALLY, and that is not cosmetic: the supercall interface
+	/* The entries are armed UNCONDITIONALLY, and that is not cosmetic: the supercall interface
 	 * (CMD_SUSFS_ADD_SUS_KSTAT) can install rules with no /proc node at all, so skipping
 	 * registration when expose_proc=0 silently turned the whole feature into a no-op - rules
 	 * accepted, never applied.  expose_proc decides whether the node exists, nothing else.
 	 *
-	 * A tracepoint, not a kprobe: there is no address field in it for a retry to trip over, so this
-	 * registration is exempt from the reset rule in kernel/susfs_kprobe.h (on this branch the stat
-	 * rewrite rides this one sys_exit tracepoint instead of a vfs_getattr kretprobe). */
-	rc = register_trace_sys_exit(kstat_sys_exit, NULL);
-	if (rc)
-		pr_warn("register_trace_sys_exit failed %d\n", rc);
-	else
-		kstat_tp_registered = true;
+	 * One entry at a time, and never fatal for the others - the same shape susfs_opath.c uses: a
+	 * number that cannot be installed leaves that one entry answering the kernel's own way while
+	 * the rest still work, and the log above names it.  Nothing here is a tracepoint any more, so
+	 * the reset rule in kernel/susfs_kprobe.h (about a probe's address field surviving a failed
+	 * registration) has no bearing on it. */
+	for (i = 0; i < (int)ARRAY_SIZE(kstat_hooks); i++) {
+		struct susfs_fp_hook *h = &kstat_hooks[i];
+
+		rc = susfs_fp_install(h);
+		if (rc) {
+			pr_warn("kstat: %s not installed (%d) - that entry answers the kernel's own way\n",
+				h->name, rc);
+			continue;
+		}
+		kstat_hooks_armed++;
+	}
+	if (!kstat_hooks_armed) {
+		pr_warn("kstat: none of the %u entries could be installed - the stat family and the dirent rewrite stay off\n",
+			(unsigned int)ARRAY_SIZE(kstat_hooks));
+		return -ENOENT;
+	}
+	if (kstat_hooks_armed < (int)ARRAY_SIZE(kstat_hooks))
+		pr_warn("kstat: %d of %u entries installed (the log above names the rest)\n",
+			kstat_hooks_armed, (unsigned int)ARRAY_SIZE(kstat_hooks));
 
 	/* 0777 is deliberate, not an oversight.  inode_permission() runs the DAC check BEFORE
 	 * security_inode_permission(), so a node the app cannot open hands it EACCES - "this exists,
@@ -1944,19 +2105,33 @@ int susfs_kstat_init(void)
 			(int)susfs_expose_proc, (int)sus_path_lsm_active());
 	}
 
-	SUSFS_LOGI("kstat armed: %d rules (sys_exit tp=%d proc=%d); stat rewrite + sus_path dirent rewrite ride that one tracepoint\n",
-		nkstat, kstat_tp_registered, kstat_proc_entry != NULL);
+	SUSFS_LOGI("kstat armed: %d rules (%d/%u table entries installed, proc=%d); stat rewrite + sus_path dirent rewrite ride those entries\n",
+		nkstat, kstat_hooks_armed, (unsigned int)ARRAY_SIZE(kstat_hooks),
+		kstat_proc_entry != NULL);
 	return 0;
 }
 
 void susfs_kstat_exit(void)
 {
+	int i;
+
 	kstat_maps_disarm();
 
-	if (kstat_tp_registered) {
-		unregister_trace_sys_exit(kstat_sys_exit, NULL);
-		tracepoint_synchronize_unregister();
-		kstat_tp_registered = false;
+	/* Every entry is restored first and the drain runs after all of them: restoring stops new
+	 * callers, and susfs_fp_drain() is what covers a task that already picked one of our wrappers
+	 * out of the table - the same order, and the same reason, as susfs_opath_exit().  Idempotent
+	 * (guarded on `installed` and on the count), because this runs both for the rollback of a
+	 * failed load and for the unload of a loaded module. */
+	for (i = 0; i < (int)ARRAY_SIZE(kstat_hooks); i++) {
+		struct susfs_fp_hook *h = &kstat_hooks[i];
+
+		if (!h->installed)
+			continue;
+		susfs_fp_remove(h);
+	}
+	if (kstat_hooks_armed) {
+		susfs_fp_drain();
+		kstat_hooks_armed = 0;
 	}
 	if (kstat_proc_entry) {
 		proc_remove(kstat_proc_entry);

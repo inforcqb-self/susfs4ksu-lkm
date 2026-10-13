@@ -83,9 +83,9 @@
  * arm64's native 141 is getpriority, its 106 delete_module, its 217 add_key, and its
  * 195/196/197 shmctl/shmat/shmdt, while AArch32 gives 141/217 to the two getdents and
  * 195/196/197 to stat64/lstat64/fstat64.  Every match is therefore gated on the caller's ABI -
- * here in sus_path_dirent_layout_id(), and the same way in susfs_kstat.c for the stat family. */
-#define SUS_NR_GETDENTS64_COMPAT 217
-#define SUS_NR_GETDENTS_COMPAT   141
+ * which table entry the call came through now, and the same way in susfs_kstat.c for the stat
+ * family.  The two listing numbers themselves live in susfs.h: the table entries that drive this
+ * filter (susfs_kstat.c) have to name them too. */
 
 struct linux_dirent64 {
     u64 d_ino;
@@ -1261,11 +1261,12 @@ static DEFINE_MUTEX(sus_path_arm_lock);
  *
  * The filter has to run AFTER the kernel has built the directory chain, and no LSM hook can do
  * it: the chain is built inside the filesystem, entry by entry, with no per-entry callback a
- * module can reach.  That leaves the syscall itself, and the hook is the shared sys_exit
- * tracepoint the stat family already rides: the chain is complete by then, and
- * syscall_get_arguments() still returns the original arguments (verified: args[1] is the
- * buffer).  For a 32-bit caller that register holds the zero-extended user pointer, which is
- * the address to use as is.
+ * module can reach.  That leaves the syscall itself, and the hook is the table entry for that
+ * number, which the stat family's layer already carries (susfs_kstat.c): the chain is complete
+ * once the original returns, and the arguments are the wrapper's own - regs->regs[1] is the
+ * buffer, read before the original ran because a syscall's return value lands in regs->regs[0].
+ * For a 32-bit caller that register holds the zero-extended user pointer, which is the address to
+ * use as is.
  *
  * Which call this is, has to be decided by (number, ABI) - not by the number alone.  Syscall
  * numbers are ABI, not per-device, and the two tables collide by design: arm64's native 141 is
@@ -1366,7 +1367,7 @@ int sus_path_dirent_layout_id(long syscall_nr, bool compat)
     return syscall_nr == __NR_getdents64 ? SUS_DIRENT_L64 : -1;
 }
 
-/* Called from the sys_exit tracepoint in susfs_kstat.c with the caller's own arguments;
+/* Called from the stat layer's entry tail in susfs_kstat.c with the caller's own arguments;
  * lay_id comes from sus_path_dirent_layout_id().  Returns the byte count the caller may parse.
  * A counted call is one that really is a listing that produced bytes: the per-ABI counter is
  * what tells a working path from one that never fires. */
@@ -1400,7 +1401,7 @@ long sus_path_dirent_filter(int lay_id, unsigned long buf, long ret)
 int sus_path_dirent_stat_line(char *buf, size_t size)
 {
     return scnprintf(buf, size,
-        "  dirent (via the sys_exit tracepoint): l64=%d compat=%d | no-filter(l64=%d compat=%d) "
+        "  dirent (via the stat layer's entries): l64=%d compat=%d | no-filter(l64=%d compat=%d) "
         "| bad-ret(l64=%d compat=%d) null-buf(l64=%d compat=%d) "
         "no-rule(l64=%d compat=%d) rewrite-fail=%d all-hidden=%d pending=%d\n",
         atomic_read(&n_dirent_calls[SUS_DIRENT_L64]),
@@ -1431,7 +1432,7 @@ static void sus_path_hooks_arm(void)
     /* Two layers, and neither of them is a syscall entry: the LSM slots (registered with the
      * module above) decide every path-based access by inode - ABI-independent, so 32-bit callers
      * are covered too, and undodgeable through a different spelling, a symlink, a hard link or a
-     * bind mount; the shared sys_exit tracepoint does the listing filter, which no LSM hook can
+     * bind mount; the stat layer's table entries does the listing filter, which no LSM hook can
      * do (sus_path_dirent_filter()).
      * Nothing else is needed: entry-layer hooks matched the caller's path STRING, which the LSM
      * match already covers more thoroughly, and a hook that cannot fire reads as coverage - so
@@ -1445,7 +1446,7 @@ static void sus_path_hooks_arm(void)
     if (no_extra)
         pr_warn("sus_path: no_extra - dirent filter off\n");
 
-    SUSFS_LOGI("sus_path: hooks armed (LSM + dirent rewrite on the shared sys_exit tracepoint)\n");
+    SUSFS_LOGI("sus_path: hooks armed (LSM + dirent rewrite on the stat layer's table entries)\n");
     mutex_unlock(&sus_path_arm_lock);
 }
 
@@ -2268,12 +2269,12 @@ int sus_path_init(void)
     if (!dirent_tmp)
         pr_warn("sus_path: dirent scratch buffer unavailable, listings will not be filtered\n");
 
-    /* The dirent rewrite rides the shared sys_exit tracepoint (registered with the stat family),
+    /* The dirent rewrite rides the stat layer's table entries (registered with the stat family),
      * not a probe of its own, and nothing has to be armed for it on the first rule: what keeps that
      * callback cheap while there is nothing to filter is the rule-count check inside
      * sus_path_filter() (and the no_extra gate in sus_path_dirent_filter()).  The scratch buffer
      * above is what the rewrite itself needs, so it is allocated here rather than at first use. */
-    SUSFS_LOGI("sus_path: dirent rewrite rides the shared sys_exit tracepoint (no probe of its own)\n");
+    SUSFS_LOGI("sus_path: dirent rewrite rides the stat layer's table entries (no probe of its own)\n");
 
     if (no_extra) {
         mutex_lock(&sus_path_param_lock);
@@ -2403,15 +2404,15 @@ void sus_path_exit(void)
 
     /* Unregister the hooks FIRST: after this nothing can match, so the entries (and their inode
      * references) can be torn down safely.  The dirent side needs no teardown of its own: it has
-     * no flag to clear and no tracepoint of its own - the one it rides belongs to the stat family,
-     * so it is unregistered there, not here.
+     * no flag to clear and no entry of its own - the entries it rides belong to the stat family,
+     * so they are restored there, not here.
      *
      * ORDER DEPENDENCY, and it is now the only thing that makes that safe: susfs_layers_down() tears
      * the layer table down in reverse, and the stat layer sits AFTER this one in susfs_layers[], so
-     * its unregister_trace_sys_exit() + tracepoint_synchronize_unregister() run before this function.
-     * Reordering the table would leave the callback reachable while this layer is being taken apart -
-     * the rule table it reads is emptied further down, and there is nothing in between any more (the
-     * old shape of this file cleared a dirent_armed flag here for exactly that window). */
+     * its susfs_fp_remove() calls + susfs_fp_drain() run before this function.  Reordering the table
+     * would leave the wrappers reachable while this layer is being taken apart - the rule table they
+     * read is emptied further down, and there is nothing in between any more (the old shape of this
+     * file cleared a dirent_armed flag here for exactly that window). */
 
     /* The retry timer must be off and no resolution pass may be in flight while the table is
      * emptied below: a pass re-finds its entry under the lock and never frees anything, but it
