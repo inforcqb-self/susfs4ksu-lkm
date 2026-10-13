@@ -444,6 +444,21 @@ jobs:
           fi
           echo "  all $tu undefined symbols are present in $S"
 
+          # __stack_chk_guard is the one import this gate cannot be satisfied about by looking at
+          # the tree: on 5.10 the kernel does have that name, so the check above passes - while
+          # `ksud insmod` still cannot resolve it, because its kallsyms walk stops at the first
+          # record that is not three fields and the module's name comes after that point on that
+          # kernel.  The kernel then refuses the load with "Unknown symbol __stack_chk_guard
+          # (err -2)".  kernel/Makefile turns the protector off wherever the kernel predates the
+          # per-task canary (5.11), and from 5.11 the compiler reads the canary from sp_el0 and
+          # references no symbol at all - so no variant may carry this name, and one that does is
+          # a build-configuration regression rather than a kernel difference.
+          if nm "$KO" | grep -qw '__stack_chk_guard'; then
+            echo "::error::$KO references __stack_chk_guard (variant $V) - on a kernel without the per-task canary that is the name 'ksud insmod' fails on; kernel/Makefile must disable the protector below 5.11"
+            exit 1
+          fi
+          echo "  the artifact references no __stack_chk_guard"
+
       # The module resolves a SECOND class of symbols BY NAME at runtime
       # (kernel/symbol_resolver.c: find_kernel_symbol_exact + the kprobe bootstrap).  Those never
       # appear in the .ko's undefined list, so the loader gate above cannot see them - and a name
