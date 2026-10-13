@@ -11,18 +11,19 @@ select_kmi() {
       "$kver".*-"$os"-*) echo "$kmi"; return 0 ;;
     esac
   done < "$2/kmis"
-  # Fallback: a custom kernel can rename osrelease and drop the -<os>- tag, so the
-  # strict match finds nothing. Match by kernel version alone, but only when that
-  # version maps to a single packaged KMI; never guess between two that share a
-  # version (5.10, 5.15).
+  # A present but non-matching Android tag is a real mismatch, not a tag-less kernel.
+  case "$rel" in *android[0-9]*) return 1 ;; esac
+  # Tag-less: match by version alone, only when it maps to one packaged KMI (5.10 and
+  # 5.15 are shared, so refused), with a numeric patch level.
   match=""
   n=0
   while IFS= read -r kmi; do
     [ -n "$kmi" ] || continue
     kver="${kmi#*-}"
-    case "$rel" in
-      "$kver".*) match="$kmi"; n=$((n + 1)) ;;
-    esac
+    case "$rel" in "$kver".*) ;; *) continue ;; esac
+    patch="${rel#"$kver".}"; patch="${patch%%-*}"
+    case "$patch" in ''|*[!0-9]*) continue ;; esac
+    match="$kmi"; n=$((n + 1))
   done < "$2/kmis"
   [ "$n" = 1 ] && { echo "$match"; return 0; }
   return 1
