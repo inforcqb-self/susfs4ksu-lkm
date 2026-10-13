@@ -7,7 +7,7 @@
  * Interrupt context: handlers must not sleep, so both paths are kern_path()'d at RULE-ADD time (proc write or
  * supercall, process context) and cached in the entry; a handler only matches (ino, dev) and swaps the pointer.  No
  * kretprobe needed - the cached references pin the files for the entry's lifetime, as upstream's re-walk does.
- * uid_scheme: enum UID_SCHEME (susfs.h:28-34), all five values with upstream's predicates (susfs.c:941-964); two of
+ * uid_scheme: enum UID_SCHEME (susfs_abi.h:67-73), all five values with upstream's predicates (susfs.c:941-964); two of
  * the five need state an LKM cannot read - see or_uid_matches() / or_in_su_domain().
  * Reverse disguise: upstream registers TWO hash entries per rule (susfs.c:844-863), the second with
  * reversed_lookup_only = true and the two pathnames swapped, and every "where did this file come from" reporter answers
@@ -174,12 +174,18 @@ static bool or_uid_matches(int scheme)
 	case UID_NON_SU_PROC:			/* susfs.c:950-953 */
 		return !or_in_su_domain();
 	case UID_UMOUNTED_APP_PROC:		/* susfs.c:954-957 */
-	case UID_UMOUNTED_PROC:			/* susfs.c:958-961 */
-		/* Upstream: test_thread_flag(TIF_PROC_UMOUNTED) [&& uid >= 10000 for the _APP variant] (susfs_def.h:98-125).  The
-		 * flag is set by the SUSFS-patched KernelSU, so both schemes ask KernelSU the same question here
-		 * (susfs_is_current_proc_umounted_app(), ksu_umount_gate.h, issue #34) and still degenerate into one predicate - a
-		 * strictly narrower gate than scheme 2, as upstream's flag is. */
+		/* Upstream: TIF_PROC_UMOUNTED && uid >= 10000 (susfs_def.h:122-125).  The flag is set
+		 * by the SUSFS-patched KernelSU and this kernel has no such patch, so the same
+		 * question is put to KernelSU by uid instead (ksu_umount_gate.h, issue #34).  What
+		 * that substitution cannot reproduce is the flag's per-THREAD grain: a process of an
+		 * umounted uid that was not forked from zygote answers yes here and no upstream. */
 		return susfs_is_current_proc_umounted_app();
+	case UID_UMOUNTED_PROC:			/* susfs.c:958-961 */
+		/* Upstream: TIF_PROC_UMOUNTED alone, with no uid condition at all - which is how it
+		 * covers init-derived processes.  Same substitution as above, and the uid half is
+		 * deliberately NOT added here: that is the whole difference between this scheme and
+		 * the one above. */
+		return susfs_is_current_proc_umounted();
 	default:				/* susfs.c:962-963 */
 		return false;
 	}

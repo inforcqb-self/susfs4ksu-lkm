@@ -30,6 +30,19 @@ static inline bool susfs_is_current_proc_umounted_app(void)
 	return susfs_ksu_umount_ask(uid);
 }
 
+/* Upstream's susfs_is_current_proc_umounted(): the same umount answer WITHOUT the app-uid half,
+ * which is what its UID_UMOUNTED_PROC rule scheme asks for (and what makes that scheme cover
+ * init-derived processes too).  There is deliberately no uid fallback when KernelSU's symbol did
+ * not resolve: there would be nothing to ask, and answering "true" would hide from every process
+ * alive - false is what the upstream flag does on a kernel without the SUSFS patch anyway. */
+static inline bool susfs_is_current_proc_umounted(void)
+{
+	if (READ_ONCE(susfs_ksu_umount_gate_off))
+		return false;
+
+	return susfs_ksu_umount_ask(current_uid().val);
+}
+
 int susfs_ksu_umount_gate_init(void);
 
 #endif /* __SUSFS_KSU_UMOUNT_GATE_H */
