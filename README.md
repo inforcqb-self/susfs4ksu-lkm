@@ -24,6 +24,10 @@ susfs_insmod /data/adb/loader/susfs_guard_lkm.ko
 rmmod susfs_guard_lkm
 ```
 
+## 作为 KernelSU 模块刷入
+
+想免去手动选 `.ko`，每个 release 还附带打包好的模块 `susfs_guard_lkm-module-<tag>-arm64.zip`：在 KernelSU 管理器里刷入、重启即可。模块会按设备内核（`/proc/sys/kernel/osrelease`）自动选择并加载对应的 `.ko`（带 `expose_proc=1`），只负责加载、不设任何 susfs 规则；若系统已存在 susfs 则跳过。仅 arm64、仅 KernelSU 系管理器。
+
 ## 接口文档
 
 全部 `/proc` 控制节点，见 **[PROC_INTERFACES.md](PROC_INTERFACES.md)**。
