@@ -20,14 +20,14 @@ def main():
         subprocess.run([sys.executable, str(ROOT / "tools/pack_module.py"),
                         "--ko-dir", str(d), "--insmod", str(d / "susfs_insmod"),
                         "--tag", "v0.0.0-test", "--out", str(out)], check=True)
-        z = zipfile.ZipFile(out)
-        names = set(z.namelist())
-        need = {"post-fs-data.sh", "customize.sh", "kmi.sh", "kmis", "module.prop",
-                "bin/susfs_insmod", "provenance.json", "LICENSE"} | {f"lib/susfs_guard_lkm-{k}.ko" for k in kmis}
-        assert not need - names, f"missing: {need - names}"
-        prop = z.read("module.prop").decode()
-        assert "id=susfs_guard_lkm" in prop and "version=v0.0.0-test" in prop, prop
-        assert z.read("kmis").decode().split() == kmis
+        with zipfile.ZipFile(out) as z:
+            names = set(z.namelist())
+            need = {"post-fs-data.sh", "customize.sh", "kmi.sh", "kmis", "module.prop",
+                    "bin/susfs_insmod", "provenance.json", "LICENSE"} | {f"lib/susfs_guard_lkm-{k}.ko" for k in kmis}
+            assert not need - names, f"missing: {need - names}"
+            prop = z.read("module.prop").decode()
+            assert "id=susfs_guard_lkm" in prop and "version=v0.0.0-test" in prop, prop
+            assert z.read("kmis").decode().split() == kmis
         print("pack test ok")
 
 

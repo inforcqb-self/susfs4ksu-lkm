@@ -38,7 +38,8 @@ def main():
         raise SystemExit(f"loader not found: {insmod}")
 
     kmis = [re.sub(r"^susfs_guard_lkm-|\.ko$", "", p.name) for p in kos]
-    version_code = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+    # epoch seconds: monotonic so two builds on one day still differ, and within int32 until 2038.
+    version_code = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
     low = min(kmis, key=lambda k: tuple(int(n) for n in k.split("-", 1)[1].split("."))).split("-", 1)[1]
     high = max(kmis, key=lambda k: tuple(int(n) for n in k.split("-", 1)[1].split("."))).split("-", 1)[1]
 
