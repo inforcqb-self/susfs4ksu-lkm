@@ -182,13 +182,17 @@ static inline bool susfs_control_node_allowed(void)
  * not one the reverse disguise applies to.  On success *out_ino is the target inode to show, *out_mnt_id the target mount id. */
 bool susfs_open_redirect_spoof_ids(unsigned long ino, unsigned long *out_ino, unsigned long *out_mnt_id);
 
-/* Asked by the name-layer entry hook (susfs_or_entry.c) for the path a caller is about to open:
- * non-NULL means a live rule redirects that inode, and the pointer is that rule's redirect target.
- * It points INTO the rule entry (a static array), so it stays valid after the call and needs no
- * buffer; or_del() only marks the entry dead - it no longer clears the name, because a reader that
- * has already been handed this pointer must not see it emptied (an empty name is not "no rule" to
- * the kernel, it is the caller's working directory). */
-const char *susfs_open_redirect_match_path(const struct path *path);
+/* The width of a rule's stored pathnames (the ABI fields are char[256], and matching that width stops
+ * a legal long path from being truncated into a rule for a different path). */
+#define SUSFS_OR_PATH_MAX 256
+
+/* Asked by the name-layer entry hook (susfs_or_entry.c) for the path a caller is about to open.
+ * The redirect target is COPIED into the caller's buffer (buflen >= SUSFS_OR_PATH_MAX) while the
+ * lookup runs under rcu_read_lock, and the return value is false when no live rule matches (or the
+ * name does not fit).  A pointer into the rule could not be handed out any more: rule slots are
+ * recycled now (a deleted rule's slot is handed out again once a grace period has passed), so
+ * nothing inside an entry may be read after the lookup returns. */
+bool susfs_open_redirect_match_path(const struct path *path, char *buf, size_t buflen);
 
 /* How many rules are live right now.  The name-layer hook runs for every open() on the system, so it
  * tests this before it resolves anything - a table with no live rule costs one load instead of a path

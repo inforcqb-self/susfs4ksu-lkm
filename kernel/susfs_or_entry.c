@@ -187,7 +187,7 @@ static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int k
 	struct susfs_open_how how;
 	struct filename *name;
 	struct path path;
-	const char *target;
+	char target[SUSFS_OR_PATH_MAX];	/* filled by susfs_open_redirect_match_path() under rcu */
 	struct file *f;
 	int dfd = AT_FDCWD;
 	long res;
@@ -336,14 +336,15 @@ static __nocfi noinline long or_entry_redirect(const struct pt_regs *regs, int k
 	if (res)
 		return SUSFS_OR_ENTRY_PASS;
 
-	target = susfs_open_redirect_match_path(&path);
-	path_put(&path);	/* no reference is kept anywhere: the rule owns none either */
-	if (!target)
+	/* The target name is copied out of the rule while the lookup holds rcu_read_lock (rule slots are
+	 * recycled after a grace period, so nothing inside an entry may be used after this call). */
+	if (!susfs_open_redirect_match_path(&path, target, sizeof(target))) {
+		path_put(&path);
 		return SUSFS_OR_ENTRY_PASS;
-	/* A rule that is being deleted keeps its name (or_del() marks it dead and leaves the fields
-	 * alone), so this is a defensive read rather than a race fix: an empty name is not a path, and
-	 * filp_open("") resolves to the caller's own working directory, i.e. it would hand out an
-	 * unrelated fd. */
+	}
+	path_put(&path);	/* no reference is kept anywhere: the rule owns none either */
+	/* Defensive: an empty name is not a path, and filp_open("") resolves to the caller's own
+	 * working directory, i.e. it would hand out an unrelated fd. */
 	if (!target[0])
 		return SUSFS_OR_ENTRY_PASS;
 
