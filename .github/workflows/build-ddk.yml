@@ -545,6 +545,7 @@ jobs:
                    mnt_id_ida ida_alloc_range ida_free namespace_sem mnt_id_xa __xa_alloc __xa_erase \
                    kallsyms_op modules_op kallsyms_lookup_name kallsyms_lookup kallsyms_on_each_symbol \
                    kallsyms_on_each_match_symbol synchronize_rcu_tasks task_work_add \
+                   put_unused_fd \
                    saved_boot_config init_mm copy_to_kernel_nofault __set_fixmap \
                    security_hook_heads static_calls_table lsm_active_cnt __static_call_update \
                    smaps_walk_ops smaps_shmem_walk_ops pagemap_ops; do
@@ -594,6 +595,13 @@ jobs:
           for s in arch_static_call_transform cpus_read_lock; do
             printf '  %-34s %s\n' "$s" "$(sym_count "$s")"
           done
+          # fsnotify_open is a static inline in include/linux/fsnotify.h on every tree we build for, so
+          # a kernel only has an out-of-line copy where some other caller happens to force one.  The
+          # name layer uses it when it exists (a redirected open then produces IN_OPEN like any other)
+          # and says so in its own log when it does not, which makes a 0 here a fact about the tree
+          # rather than a feature that failed to arm.
+          echo "  fsnotify_open (out-of-line copy, optional): $(sym_count fsnotify_open)"
+          echo "  check_zeroed_user (optional): $(sym_count check_zeroed_user)"
           [ "$hardmiss" = "0" ] || exit 1
           echo "the three mount show callbacks are present in $S"
 

@@ -67,6 +67,7 @@
 #include "susfs.h"		/* susfs_control_node_allowed(), sus_path_inode_hidden_public() */
 #include "susfs_opath.h"
 #include "susfs_fp_hook.h"
+#include "susfs_or_entry.h"	/* open_redirect's name layer shares exactly these five entries */
 
 /* The AArch32 numbers.  No arm64 header defines them as __NR_*: they are what
  * arch/arm64/include/asm/unistd32.h is generated from, i.e.
@@ -147,13 +148,15 @@ module_param_named(opath_dump, opath_dump, int, 0644);
  * lock around it, and that is deliberate - see the note in susfs_opath_exit(). */
 static bool opath_exiting;
 
-/* The post-check every wrapper funnels into.
+/* The post-check every wrapper funnels into - and, since open_redirect's name layer returns an fd of
+ * its own from inside those wrappers, the entry point it calls too.  Whatever produced the answer,
+ * an O_PATH fd that names a sus_path-hidden file is taken away the same way.
  *
  * Context: the syscall of the task that opened the file, i.e. ordinary process context - not a
  * tracepoint's atomic section.  That is what makes the layer possible at all: close_fd_get_file()
  * takes files->file_lock and sus_path_inode_hidden_public() takes sus_path_lock, and neither may
  * be taken from the contexts the kprobe layers have to live with. */
-static __nocfi long susfs_opath_post(long ret)
+__nocfi long susfs_opath_post_fd(long ret)
 {
 	struct file *f, *victim;
 	bool hidden;
@@ -219,7 +222,7 @@ static __nocfi long susfs_opath_post(long ret)
  * convention - a wrapper that read the native slot on behalf of a 32-bit task would hand it a
  * native syscall, i.e. a different syscall with a different argument layout.  Each wrapper
  * reads only its own slot.
- * __nocfi is mandatory on both the wrapper and susfs_opath_post(): the wrapper is reached
+ * __nocfi is mandatory on both the wrapper and susfs_opath_post_fd(): the wrapper is reached
  * through an indirect call out of the kernel's table, and it calls the original and the two
  * resolved kernel functions the same way.
  * The NULL test on the slot is not about the publish order - susfs_fp_install() publishes the
@@ -248,22 +251,40 @@ static __nocfi long susfs_opath_post(long ret)
  * ARM overrides in arch/arm64/include/uapi/asm/fcntl.h:23-26 exist BECAUSE of the 32-bit ABI and
  * leave O_PATH alone), and the 32-bit flags reach build_open_how() untranslated
  * (fs/open.c:1374-1377), so one constant is right for both sides.
- * n_opath_seen is bumped here rather than in susfs_opath_post() so that a skipped ordinary open
- * still shows up as "a wrapper ran" - that counter is what tells a device bring-up apart
- * "the entry is not reached at all" from "the entry is reached and the O_PATH test says no". */
-#define SUSFS_OPATH_WRAPPER(fn, slot, flags_reg)			\
+ * n_opath_seen is bumped before anything else in the wrapper, so that a skipped ordinary open - and
+ * an open that open_redirect's name layer took over - still shows up as "a wrapper ran".  That
+ * counter is what tells a device bring-up apart "the entry is not reached at all" from "the entry is
+ * reached and the O_PATH test says no". */
+#define SUSFS_OPATH_WRAPPER(fn, slot, flags_reg, kind)			\
 	static __nocfi long fn(const struct pt_regs *regs)		\
 	{								\
 		susfs_syscall_fn_t orig = READ_ONCE(slot);		\
+		susfs_or_entry_fn_t or_hook = READ_ONCE(susfs_or_entry_hook);	\
 		long ret;						\
 									\
 		if (!orig)						\
 			return -ENOSYS;					\
-		ret = orig(regs);					\
 		atomic_inc(&n_opath_seen);				\
+		/* open_redirect's name layer is asked first, and gets the same five entries: a	\
+		 * syscall entry can have only one wrapper, so it registers a hook instead of	\
+		 * installing its own.  When it redirects, the original syscall is not called at	\
+		 * all - it opens the target itself and returns the fd, and that fd goes through	\
+		 * susfs_opath_post_fd() right here, so an O_PATH answer is judged the same way	\
+		 * whichever of the two produced it (and a negative errno passes straight through	\
+		 * that function, which leaves anything that is not an fd alone). */		\
+		if (or_hook) {						\
+			ret = or_hook(regs, (kind));			\
+			if (ret != SUSFS_OR_ENTRY_PASS) {		\
+				if ((flags_reg) >= 0 && ret >= 0 &&	\
+				    !(regs->regs[flags_reg] & O_PATH))	\
+					return ret;			\
+				return susfs_opath_post_fd(ret);	\
+			}						\
+		}							\
+		ret = orig(regs);					\
 		if ((flags_reg) >= 0 && !(regs->regs[flags_reg] & O_PATH))	\
 			return ret;					\
-		return susfs_opath_post(ret);				\
+		return susfs_opath_post_fd(ret);			\
 	}
 
 static susfs_syscall_fn_t opath_orig_openat;
@@ -272,11 +293,11 @@ static susfs_syscall_fn_t opath_orig_compat_open;
 static susfs_syscall_fn_t opath_orig_compat_openat;
 static susfs_syscall_fn_t opath_orig_compat_openat2;
 
-SUSFS_OPATH_WRAPPER(susfs_opath_openat, opath_orig_openat, 2)
-SUSFS_OPATH_WRAPPER(susfs_opath_openat2, opath_orig_openat2, -1)
-SUSFS_OPATH_WRAPPER(susfs_opath_compat_open, opath_orig_compat_open, 1)
-SUSFS_OPATH_WRAPPER(susfs_opath_compat_openat, opath_orig_compat_openat, 2)
-SUSFS_OPATH_WRAPPER(susfs_opath_compat_openat2, opath_orig_compat_openat2, -1)
+SUSFS_OPATH_WRAPPER(susfs_opath_openat, opath_orig_openat, 2, SUSFS_OR_ENTRY_OPENAT)
+SUSFS_OPATH_WRAPPER(susfs_opath_openat2, opath_orig_openat2, -1, SUSFS_OR_ENTRY_OPENAT2)
+SUSFS_OPATH_WRAPPER(susfs_opath_compat_open, opath_orig_compat_open, 1, SUSFS_OR_ENTRY_COMPAT_OPEN)
+SUSFS_OPATH_WRAPPER(susfs_opath_compat_openat, opath_orig_compat_openat, 2, SUSFS_OR_ENTRY_COMPAT_OPENAT)
+SUSFS_OPATH_WRAPPER(susfs_opath_compat_openat2, opath_orig_compat_openat2, -1, SUSFS_OR_ENTRY_COMPAT_OPENAT2)
 
 /* The five entries.  nr < 0 means "no native entry": arm64 has no native open at all, and for
  * the AArch32 open(5) the native number 5 is setxattr (include/uapi/asm-generic/unistd.h:47) -
@@ -349,6 +370,26 @@ static struct susfs_fp_hook opath_hooks[] = {
 		.orig_slot_compat = &opath_orig_compat_openat,
 	},
 };
+
+/* Whether the entries open_redirect's name layer needs actually carry this layer's wrapper.  "The
+ * layer is armed" has to mean those entries and not "the module came up": opath_dump=1 installs
+ * nothing at all, and opath_test=N installs at most the one entry it selects, while both report
+ * success.  The first two entries are the native openat/openat2, which is what every 64-bit caller
+ * goes through (every tree this module supports has __NR_openat2); a device carrying only the compat
+ * entries is not a configuration the name layer can work on.  Installed is written by
+ * susfs_fp_install()/susfs_fp_remove() under the same lock the layer arms under, and read here
+ * without it, hence the READ_ONCE. */
+bool susfs_opath_armed(void)
+{
+	/* The index is only used where the array really holds that entry: __NR_openat2 exists in every
+	 * tree this module supports, and the guard keeps a tree without it from asking about the compat
+	 * entry by mistake. */
+#ifdef __NR_openat2
+	return READ_ONCE(opath_hooks[0].installed) && READ_ONCE(opath_hooks[1].installed);
+#else
+	return READ_ONCE(opath_hooks[0].installed);
+#endif
+}
 
 /* Table entries are data, so this is a plain read - what it is for is telling "our wrapper is
  * in there" from "the kernel's own stub is in there", which the address alone cannot answer on
@@ -538,6 +579,7 @@ int susfs_opath_init(void)
 		pr_warn("opath: %d of %d selected table entries installed - O_PATH is answered only for those (the log above names the rest)\n",
 			armed, attempted);
 
+
 	if (susfs_control_node_allowed()) {
 		opath_proc_entry = proc_create("susfs_opath", 0777, NULL, &opath_proc_ops);
 		if (!opath_proc_entry)
@@ -575,6 +617,10 @@ void susfs_opath_exit(void)
 	if (opath_exiting)
 		return;
 	opath_exiting = true;
+
+	/* Before the entries come out: the name layer must stop being reachable from them at the same
+	 * moment, and susfs_or_entry_exit() (called from open_redirect's exit, which runs first because
+	 * the layer table is torn down in reverse) has already cleared its hook pointer. */
 
 	for (i = 0; i < (int)ARRAY_SIZE(opath_hooks); i++)
 		susfs_fp_remove(&opath_hooks[i]);

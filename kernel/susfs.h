@@ -150,6 +150,16 @@ void susfs_hide_syms_exit(void);
 bool susfs_hide_syms_active(void);
 bool sus_path_lsm_active(void);
 
+/* The O_PATH layer's own state, for the name layer that borrows its five open entries: true only when
+ * at least one of those entries really carries its wrapper (opath_dump=1 and opath_test=N both leave
+ * entries unwrapped while reporting success - see susfs_opath.c). */
+bool susfs_opath_armed(void);
+
+/* The same layer's post-check, called by open_redirect's name layer with the fd it produced itself, so
+ * an O_PATH answer is judged by one implementation whichever of the two produced it.  A negative
+ * argument (an errno) passes straight through. */
+long susfs_opath_post_fd(long ret);
+
 /* sus_path's hidden decision, for the layers that hold the inode the kernel resolved rather than a path they would have to
  * resolve themselves (susfs_opath.c post-checks the file an open(..., O_PATH) produced).  Same question the LSM hooks ask,
  * same answer: identity first, then (dev, i_ino), never a path string.  Not a new judgement - it is the static
@@ -171,5 +181,29 @@ static inline bool susfs_control_node_allowed(void)
  * this is a lookup by ino alone and returns false when the number is ambiguous (two rules, same redirected ino) or the caller is
  * not one the reverse disguise applies to.  On success *out_ino is the target inode to show, *out_mnt_id the target mount id. */
 bool susfs_open_redirect_spoof_ids(unsigned long ino, unsigned long *out_ino, unsigned long *out_mnt_id);
+
+/* Asked by the name-layer entry hook (susfs_or_entry.c) for the path a caller is about to open:
+ * non-NULL means a live rule redirects that inode, and the pointer is that rule's redirect target.
+ * It points INTO the rule entry (a static array), so it stays valid after the call and needs no
+ * buffer; or_del() only marks the entry dead - it no longer clears the name, because a reader that
+ * has already been handed this pointer must not see it emptied (an empty name is not "no rule" to
+ * the kernel, it is the caller's working directory). */
+const char *susfs_open_redirect_match_path(const struct path *path);
+
+/* How many rules are live right now.  The name-layer hook runs for every open() on the system, so it
+ * tests this before it resolves anything - a table with no live rule costs one load instead of a path
+ * lookup, and deleting the last rule takes that cost away again.  Written under the rule lock. */
+extern unsigned int susfs_open_redirect_rules;
+
+static inline bool susfs_open_redirect_active(void)
+{
+	return READ_ONCE(susfs_open_redirect_rules) != 0;
+}
+
+/* The name-layer redirection of the same feature: no cached path, no inode held.  Optional - it
+ * stays unarmed when a symbol it needs is missing, and such a layer makes open_redirect refuse
+ * rules - and on by default (the or_entry parameter can turn it off). */
+int susfs_or_entry_init(void);
+void susfs_or_entry_exit(void);
 
 #endif
