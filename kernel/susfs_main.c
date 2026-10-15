@@ -9,6 +9,7 @@
 #include <linux/version.h>	/* LINUX_VERSION_CODE: the MODULE_IMPORT_NS spelling below */
 
 #include "symbol_resolver.h"
+#include "patch_memory.h"	/* ksu_patch_memory_init(): the flush helper's name differs per kernel */
 #include "susfs_log.h"
 #include "ksu_umount_gate.h"
 #include "lsm_hook.h"
@@ -163,6 +164,14 @@ static int __init susfs_init(void)
     if (susfs_imports_crosscheck())
         return -EINVAL;
 
+    /* Text/data patching needs a cache-flush helper whose name differs between kernels; resolve it
+     * here, before any layer can patch.  Not fatal by itself, but below 6.12 sus_path is a fatal
+     * layer and it installs its hooks by patching text, so a kernel carrying neither spelling ends
+     * up refusing to load the module - with the reason in the log right here.  On 6.12+ that path
+     * goes through static calls and this only costs the layers that do patch. */
+    if (ksu_patch_memory_init())
+        pr_warn("susfs_guard_lkm: patching unavailable on this kernel (see patch_memory.c)\n");
+
     for (i = 0; i < (int)ARRAY_SIZE(susfs_layers); i++) {
         int ret;
 
@@ -244,10 +253,10 @@ MODULE_LICENSE("GPL");
  * is refused.  Both spellings are kept below and chosen by version, so the same source
  * builds from 5.10 through 6.18.
  *
- * Note this is necessary but NOT sufficient for plain insmod: nine further symbols we
+ * Note this is necessary but NOT sufficient for plain insmod: further symbols we
  * reference are not in the kernel's export table in any of the six supported GKI
  * variants (kallsyms_lookup_name and friends, saved_boot_config, task_work_add, init_mm,
- * __set_fixmap, copy_to_kernel_nofault, dcache_clean_inval_poc), so loading without a
+ * __set_fixmap, copy_to_kernel_nofault), so loading without a
  * helper still needs those to be resolved at runtime.  The userspace loader
  * (tools/susfs_insmod.c) sidesteps the whole question by rewriting undefined symbols to
  * absolute addresses, exactly as KernelSU's ksud does - see README. */

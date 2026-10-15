@@ -9,6 +9,7 @@
 
 #include "patch_memory.h"
 #include "susfs_log.h"
+#include "symbol_resolver.h"
 #include <linux/cpumask.h>
 #include <linux/gfp.h>
 #include <linux/uaccess.h>
@@ -68,20 +69,55 @@ fail:
     return 0;
 }
 
-/* dcache/icache flush: 5.14+ replaced __flush_dcache_area/__flush_icache_range
- * with dcache_clean_inval_poc / caches_clean_inval_pou. */
-#if KSU_NEW_DCACHE_FLUSH
-#define ksu_flush_dcache(start, sz)                                                    \
-    ({                                                                                 \
-        unsigned long __start = (start);                                               \
-        unsigned long __end = __start + (sz);                                          \
-        dcache_clean_inval_poc(__start, __end);                                        \
-    })
-#define ksu_flush_icache(start, end) caches_clean_inval_pou
-#else
-#define ksu_flush_dcache(start, sz) __flush_dcache_area((void *)start, sz)
-#define ksu_flush_icache(start, end) __flush_icache_range
-#endif
+/* dcache/icache flush: 5.14 replaced __flush_dcache_area/__flush_icache_range with
+ * dcache_clean_inval_poc/caches_clean_inval_pou.  Which spelling a kernel carries is NOT decided by
+ * its version number - a vendor kernel can keep the old one (measured: a Samsung 5.x kernel has no
+ * dcache_clean_inval_poc, and a module built from 5.14+ headers fails to load there with "Unknown
+ * symbol dcache_clean_inval_poc").  Both spellings are therefore resolved by name at run time, new
+ * first, and a kernel carrying neither loses patching (cleanly: ksu_patch_text_nosync() refuses)
+ * instead of patching without the flush the write needs.  The two dcache helpers also differ in
+ * signature: the new one takes (start, end), the old one (addr, size). */
+static void (*ksu_dcache_new_fn)(unsigned long start, unsigned long end);
+static void (*ksu_dcache_old_fn)(void *addr, size_t size);
+static void (*ksu_icache_fn)(unsigned long start, unsigned long end);
+
+/* Resolve them once, from susfs_init() after the symbol resolver is up and before any layer can
+ * patch.  Returns 0 when patching is possible. */
+int ksu_patch_memory_init(void)
+{
+    ksu_dcache_new_fn = (void *)find_kernel_symbol_exact("dcache_clean_inval_poc");
+    ksu_dcache_old_fn = (void *)find_kernel_symbol_exact("__flush_dcache_area");
+    ksu_icache_fn = (void *)find_kernel_symbol_exact("caches_clean_inval_pou");
+    if (!ksu_icache_fn)
+        ksu_icache_fn = (void *)find_kernel_symbol_exact("__flush_icache_range");
+
+    if (!ksu_dcache_new_fn && !ksu_dcache_old_fn)
+        pr_warn("patch_memory: no dcache flush symbol (dcache_clean_inval_poc / __flush_dcache_area) - patching is off\n");
+    if (!ksu_icache_fn)
+        pr_warn("patch_memory: no icache flush symbol (caches_clean_inval_pou / __flush_icache_range) - an icache flush request would be refused\n");
+
+    /* Only the dcache helper decides whether patching works: every caller today asks for
+     * KSU_PATCH_TEXT_FLUSH_DCACHE, and an icache flush would be refused individually below anyway.
+     * Reporting "patching is off" for a missing icache name would be wrong on a kernel that patches
+     * fine without it. */
+    return (!ksu_dcache_new_fn && !ksu_dcache_old_fn) ? -EOPNOTSUPP : 0;
+}
+
+/* Both are indirect calls into the kernel, so each carries the __nocfi noinline the rest of the
+ * module uses (tools/cfi_sites.py fails the build otherwise). */
+static __nocfi noinline void ksu_flush_dcache(unsigned long start, size_t sz)
+{
+    if (ksu_dcache_new_fn)
+        ksu_dcache_new_fn(start, start + sz);
+    else if (ksu_dcache_old_fn)
+        ksu_dcache_old_fn((void *)start, sz);
+}
+
+static __nocfi noinline void ksu_flush_icache(unsigned long start, unsigned long end)
+{
+    if (ksu_icache_fn)
+        ksu_icache_fn(start, end);
+}
 
 struct patch_text_info {
     void *dst;
@@ -98,6 +134,13 @@ static int ksu_patch_text_nosync(void *dst, void *src, size_t len, int flags)
     unsigned long phy;
     void *map;
     int ret;
+
+    /* Refused before anything is written: a store without its flush leaves other CPUs with a stale
+     * copy of the patched word, which is a crash somewhere else entirely. */
+    if ((flags & KSU_PATCH_TEXT_FLUSH_ICACHE) && !ksu_icache_fn)
+        return -EOPNOTSUPP;
+    if ((flags & KSU_PATCH_TEXT_FLUSH_DCACHE) && !ksu_dcache_new_fn && !ksu_dcache_old_fn)
+        return -EOPNOTSUPP;
 
     phy = phys_from_virt(p, &phy_err);
     if (phy_err) {

@@ -14,27 +14,17 @@ susfs_guard_lkm-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o
               susfs_avc_spoof.o susfs_supercall.o susfs_hide_syms.o imports_guard.o \
               ksu_umount_gate.o susfs_fp_hook.o susfs_opath.o fsnotify_lifetime.o btf_layout.o
 
-# 5.14+ replaced __flush_dcache_area/__flush_icache_range with
-# dcache_clean_inval_poc/caches_clean_inval_pou.  Detect which to use.
-#
-# The detection uses `grep -l` (a filename, or nothing) rather than an exit status: the old
-# `grep -q ...; echo $$?` form returned 2 when srctree was empty - and 2 is TRUE in
-# `#if KSU_NEW_DCACHE_FLUSH`, so an unset srctree silently selected the 5.14+ spelling on
-# every kernel and left an undefined dcache_clean_inval_poc in the module.  Fail loudly
-# instead of guessing.
+# The dcache/icache flush helper is NOT picked at build time any more: which spelling a kernel
+# carries is not decided by its version number (a vendor kernel can keep the pre-5.14 name, measured
+# on a Samsung 5.x kernel), so kernel/patch_memory.c resolves it by name at run time.  Building with
+# 5.14+ headers used to leave an undefined dcache_clean_inval_poc that such a kernel then refused to
+# resolve, i.e. the module could not load at all.
 #
 # `srctree` is set only when kbuild reaches this file (make -C $KDIR M=$PWD ...).  The check for
 # it used to be a parse-time $(error), which aborted make before any goal was chosen and so made
 # the `all:` entry point below - and KDIR's default - unreachable.  It now lives in the `all:`
 # recipe, i.e. it fires when the build is actually attempted.
 KSU_SRCTREE_MISSING := $(if $(srctree),0,1)
-KSU_HAS_OLD_DCACHE := $(shell grep -l __flush_dcache_area $(srctree)/arch/arm64/include/asm/cacheflush.h 2>/dev/null)
-ifneq ($(KSU_HAS_OLD_DCACHE),)
-KSU_NEW_DCACHE_FLUSH := 0
-else
-KSU_NEW_DCACHE_FLUSH := 1
-endif
-ccflags-y += -DKSU_NEW_DCACHE_FLUSH=$(KSU_NEW_DCACHE_FLUSH)
 
 # Match SukiSU's build flags: upstream code declares after statements and
 # casts symbol addresses (unsigned long) to function pointers.

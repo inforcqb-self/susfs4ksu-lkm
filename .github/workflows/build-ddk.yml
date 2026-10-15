@@ -547,8 +547,7 @@ jobs:
                    kallsyms_on_each_match_symbol synchronize_rcu_tasks task_work_add \
                    saved_boot_config init_mm copy_to_kernel_nofault __set_fixmap \
                    security_hook_heads static_calls_table lsm_active_cnt __static_call_update \
-                   smaps_walk_ops smaps_shmem_walk_ops pagemap_ops \
-                   dcache_clean_inval_poc caches_clean_inval_pou __flush_dcache_area; do
+                   smaps_walk_ops smaps_shmem_walk_ops pagemap_ops; do
             n=$(sym_count "$s"); printf '  %-34s %s\n' "$s" "$n"
             if [ "$n" = "0" ]; then
               echo "::warning::$s is not in $S (variant $V) - the feature that resolves it by name cannot arm on this kernel"
@@ -563,6 +562,29 @@ jobs:
               done
             fi
           done
+          # The dcache/icache flush helper is resolved by name at run time (kernel/patch_memory.c), so
+          # the four spellings are deliberately NOT in the loop above: a warning there would read
+          # "cannot arm on this kernel" for the spelling a given tree does not carry, which is wrong -
+          # the fallback is what makes that harmless.  What still matters is the pair: a tree with
+          # NEITHER dcache spelling yields a module that cannot patch, and below 6.12 that is a module
+          # that does not load at all (sus_path is fatal and installs its hooks by patching text), so
+          # this one is a hard failure.
+          if [ "$(sym_count dcache_clean_inval_poc)" = "0" ] && [ "$(sym_count __flush_dcache_area)" = "0" ]; then
+            echo "::error::$S (variant $V) has neither dcache_clean_inval_poc nor __flush_dcache_area - the module cannot flush a patch on this kernel"
+            exit 1
+          fi
+          if [ "$(sym_count dcache_clean_inval_poc)" != "0" ]; then
+            echo "  dcache flush helper: dcache_clean_inval_poc"
+          else
+            echo "  dcache flush helper: __flush_dcache_area"
+          fi
+          if [ "$(sym_count caches_clean_inval_pou)" != "0" ]; then
+            echo "  icache flush helper: caches_clean_inval_pou"
+          elif [ "$(sym_count __flush_icache_range)" != "0" ]; then
+            echo "  icache flush helper: __flush_icache_range"
+          else
+            echo "  icache flush helper: absent (nothing requests an icache flush)"
+          fi
           # The two kernel internals the >= 6.12 static-call switch goes THROUGH: the module resolves
           # __static_call_update by name and calls it, and that call's own body is what may reach
           # arch_static_call_transform (only under CONFIG_HAVE_STATIC_CALL_INLINE) and cpus_read_lock.
