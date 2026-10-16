@@ -15,6 +15,7 @@
 #include "lsm_hook.h"
 #include "susfs.h"
 #include "susfs_opath.h"	/* SUSFS_OPATH_NODE + the layer's init/exit */
+#include "susfs_readlinkat.h"	/* SUSFS_READLINKAT_NODE + the layer's init/exit */
 
 /* The module's own name lives in susfs.h (SUSFS_LKM_MODULE_NAME / SUSFS_LKM_SYSFS_DIR):
  * /sys/module's directory and the rules that hide it (susfs_hide_syms.c) must agree, and the
@@ -50,6 +51,9 @@ static const char *const susfs_self_hide_paths[] = {
     /* The O_PATH layer's node: it reports the four sys_call_table/compat_sys_call_table
      * entries and the counters that say whether a wrapper ever ran. */
     SUSFS_OPATH_NODE,
+    /* The readlinkat layer's node: armed flag + the counters that say whether the kretprobe ran
+     * and ever answered ENOENT. */
+    SUSFS_READLINKAT_NODE,
     /* The module's own sysfs directory is NOT here: it belongs to hide_module
      * (susfs_hide_syms.c), which adds and drops that rule at runtime. */
 };
@@ -112,6 +116,9 @@ static struct {
      * answering the pre-layer way (which is what the layer exists to fix, not what makes the
      * module useful), and every entry carries its own reason in the log. */
     { "opath",		susfs_opath_init,		susfs_opath_exit,	false, false },
+    /* After sus_path, whose rule strings it matches against.  NOT fatal: a failure only leaves
+     * readlinkat answering the pre-layer way (the leak it exists to close). */
+    { "readlinkat",	susfs_readlinkat_init,		susfs_readlinkat_exit,	false, false },
     /* After sus_path, whose rule table it asks.  NOT fatal: when it does not arm the
      * post-hoc filter still hides, it is only detectable while doing so. */
     { "dirent",		susfs_sus_dirent_init,		susfs_sus_dirent_exit,	false, false },

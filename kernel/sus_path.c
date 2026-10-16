@@ -1197,6 +1197,37 @@ bool sus_path_inode_hidden_public(struct inode *inode)
     return sus_path_inode_hidden(inode);
 }
 
+/* By the registered path STRING, not an inode. For a layer that only has the caller's pathname and
+ * runs where it cannot resolve it to an inode without sleeping - the readlinkat kretprobe
+ * (susfs_readlinkat.c) runs in a probe handler where kern_path() would BUG. The caller passes an
+ * already lexically-canonicalized absolute path; this matches it against each rule's stored path[]
+ * (also kept without a trailing slash), under the same spinlock and the same uid gate
+ * (sus_path_entry_gate_any) as sus_path_dirent_hidden(), so a non-root app is answered hidden and
+ * root is not. Exact match only: a hidden directory's own path (the readlinkat-on-a-dir leak). */
+bool sus_path_string_hidden_public(const char *abspath)
+{
+    struct sus_path_entry *e;
+    size_t len;
+    bool hidden = false;
+
+    if (!abspath || abspath[0] != '/' || !READ_ONCE(sus_path_count))
+        return false;
+    if (sus_path_is_resolver())
+        return false;
+
+    len = strlen(abspath);
+    spin_lock(&sus_path_lock);
+    list_for_each_entry(e, &sus_path_list, list) {
+        if (e->path_len == len && !strcmp(e->path, abspath) &&
+            sus_path_entry_gate_any(e)) {
+            hidden = true;
+            break;
+        }
+    }
+    spin_unlock(&sus_path_lock);
+    return hidden;
+}
+
 static int sus_path_inode_getattr(const struct path *path)
 {
     struct inode *inode;
