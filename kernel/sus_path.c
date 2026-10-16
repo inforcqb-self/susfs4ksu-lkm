@@ -784,6 +784,7 @@ static void sus_path_pending_work(struct work_struct *w)
  * looked installed. */
 static int sus_path_inode_getattr(const struct path *path);
 static int sus_path_inode_permission(struct inode *inode, int mask);
+static int sus_path_inode_readlink(struct dentry *dentry);
 
 /* The signatures MUST match the LSM hook types exactly, and must NOT be __nocfi:
  * this kernel uses kCFI with cross-module checks, so the call site compares type
@@ -822,6 +823,9 @@ static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_getattr),
 static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_permission),
 					   typeof(&sus_path_inode_permission)),
 	      "inode_permission hook signature mismatch");
+static_assert(__builtin_types_compatible_p(LSM_HOOK_FN_TYPE(inode_readlink),
+					   typeof(&sus_path_inode_readlink)),
+	      "inode_readlink hook signature mismatch");
 
 /* ---- name-based operations ----
  *
@@ -951,6 +955,11 @@ SUS_LSM_ORIG_CALL(inode_permission, struct inode *inode, int mask)
 	return fn(inode, mask);
 }
 
+SUS_LSM_ORIG_CALL(inode_readlink, struct dentry *dentry)
+{
+	return fn(dentry);
+}
+
 SUS_LSM_ORIG_CALL(inode_unlink, struct inode *dir, struct dentry *dentry)
 {
 	return fn(dir, dentry);
@@ -1076,8 +1085,12 @@ static struct ksu_lsm_hook sus_path_getattr_hook =
 static struct ksu_lsm_hook sus_path_perm_hook =
 	KSU_LSM_HOOK_INSERT(inode_permission, (void *)sus_path_inode_permission);
 
+static struct ksu_lsm_hook sus_path_readlink_hook =
+	KSU_LSM_HOOK_INSERT(inode_readlink, (void *)sus_path_inode_readlink);
+
 static atomic_t n_enoent_getattr = ATOMIC_INIT(0);
 static atomic_t n_enoent_perm = ATOMIC_INIT(0);
+static atomic_t n_enoent_readlink = ATOMIC_INIT(0);
 
 /* Store the registered path without a trailing slash, so "path/" and "path" both match
  * "path" and "path/child". */
@@ -1250,6 +1263,33 @@ static int sus_path_nameop_hit(void)
 {
     atomic_inc(&n_enoent_nameop);
     return -ENOENT;
+}
+
+/* readlink(2) is the third face of the same question.  The stat family is answered by
+ * inode_getattr and the path-based operations by inode_permission, but a symlink is read through a
+ * different hook: without this one an app could readlink a hidden path - or a symlink pointing at
+ * one - while stat answered ENOENT, and that disagreement is itself the tell.  It says "something
+ * here is being hidden" to anyone who compares the two answers.
+ *
+ * do_readlinkat() calls security_inode_readlink() on the way in, before i_op->readlink (fs/stat.c),
+ * so refusing here is enough, and it is deliberately the cheapest possible answer: the dentry has
+ * already been resolved by the kernel under the caller's own root/cwd/mount namespace, so every
+ * lexical spelling (//, ./, .., a trailing slash), a dirfd-relative pathname and a chain of
+ * symlinks all arrive here as the same inode.  No path string is read, normalized or re-resolved,
+ * so there is no second lookup to race against - and refusing before i_op->readlink means a
+ * get_link() implementation never runs, which is what keeps this from running into the reference
+ * handling those have (procfs' /proc/<pid>/fd/N is the one that only releases its struct path on
+ * the success path, fixed in PR #90).  Matching on the inode is also what keeps the answer
+ * identical to the other two hooks standing next to it. */
+static int sus_path_inode_readlink(struct dentry *dentry)
+{
+    if (sus_path_dentry_hidden(dentry)) {
+        atomic_inc(&n_enoent_readlink);
+        return -ENOENT;
+    }
+    /* Not hidden: no opinion, and - as above - what SELinux answers is what the caller gets. */
+    SUS_LSM_PASS_ORIG(sus_path_readlink_hook, inode_readlink, dentry);
+    return 0;
 }
 
 static int sus_path_inode_unlink(struct inode *dir, struct dentry *dentry)
@@ -2021,9 +2061,10 @@ static int sus_path_format_list(char *buf, size_t size)
     int n = 0;
 
     n = sus_path_list_puts(buf, n, &trunc,
-                   "hide_from_apps=%d  enoent: getattr=%d perm=%d nameop=%d meta=%d\n",
+                   "hide_from_apps=%d  enoent: getattr=%d perm=%d readlink=%d nameop=%d meta=%d\n",
                    hide_from_apps, atomic_read(&n_enoent_getattr),
-                   atomic_read(&n_enoent_perm), atomic_read(&n_enoent_nameop),
+                   atomic_read(&n_enoent_perm), atomic_read(&n_enoent_readlink),
+                   atomic_read(&n_enoent_nameop),
                    atomic_read(&n_enoent_meta));
     n = sus_path_list_puts(buf, n, &trunc,
                    "dirent: pending=%d (counters: /proc/susfs_kstat)\n",
@@ -2437,7 +2478,7 @@ int sus_path_init(void)
             &sus_path_statfs_hook, &sus_path_setattr_hook,
             &sus_path_getxattr_hook, &sus_path_listxattr_hook,
             &sus_path_setxattr_hook, &sus_path_removexattr_hook,
-            &sus_path_notify_hook,
+            &sus_path_notify_hook, &sus_path_readlink_hook,
         };
         int i;
 
@@ -2548,7 +2589,7 @@ void sus_path_exit(void)
             &sus_path_statfs_hook, &sus_path_setattr_hook,
             &sus_path_getxattr_hook, &sus_path_listxattr_hook,
             &sus_path_setxattr_hook, &sus_path_removexattr_hook,
-            &sus_path_notify_hook,
+            &sus_path_notify_hook, &sus_path_readlink_hook,
         };
         int i;
 
