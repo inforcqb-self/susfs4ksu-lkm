@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * susfs_open_redirect.c - redirect open of a target path to another path (SUSFS OPEN_REDIRECT feature), LKM port.
- * Hook: path_openat / do_sys_openat2 / do_filp_open are LTO-inlined into the syscall entry, so none can be kprobed; the
- * only out-of-line symbol on the user-open path is vfs_open(path, file) (measured: 123/123 hits for `cat`).  vfs_open is
- * the inode layer - d_inode is resolved - so rules match by (target_ino, target_dev) exactly like upstream.
- * Interrupt context: handlers must not sleep, so both paths are kern_path()'d at RULE-ADD time (proc write or
- * supercall, process context) and cached in the entry; a handler only matches (ino, dev) and swaps the pointer.  No
- * kretprobe needed - the cached references pin the files for the entry's lifetime, as upstream's re-walk does.
- * uid_scheme: enum UID_SCHEME (susfs.h:28-34), all five values with upstream's predicates (susfs.c:941-964); two of
+ * Forward direction: not in this file.  path_openat / do_sys_openat2 / do_filp_open are LTO-inlined into the syscall
+ * entry, so none can be kprobed, and the only out-of-line symbol on the user-open path (vfs_open(file)) sits at the
+ * inode layer, where the name is already gone - a swap there has to pin a dentry and a mount per rule, which then
+ * blocks umount.  Redirection is done one level up instead, at the syscall entry, by susfs_or_entry.c (wrapper
+ * replacement; see that file header).  Nothing here holds a struct path any more: a rule keeps (target_ino, target_dev,
+ * target_igen), the spoofed kstatfs snapshot and the two pathnames, and the entry hook resolves the name it was given.
+ * Because nothing is pinned, the numbers are all that identify a rule's files: a filesystem may reuse an inode number
+ * after a file is deleted, so every match also compares i_generation (the same field NFS export handles use; a
+ * filesystem that does not maintain it reports 0, which is no worse than matching the number alone).  The rule table
+ * is a fixed array of SUS_OR_MAX slots that ARE reused: deleting or replacing a rule retires its slot, and the slot is
+ * cleared and handed out again once a grace period has passed (or_reclaim_slot() - every reader copies what it needs
+ * out of an entry under rcu_read_lock, which is what makes that safe).  susfs_open_redirect_rules counts live rules, so
+ * the name layer stops paying a lookup once the last rule is gone.
+ * uid_scheme: enum UID_SCHEME (susfs_abi.h:67-73), all five values with upstream's predicates (susfs.c:941-964); two of
  * the five need state an LKM cannot read - see or_uid_matches() / or_in_su_domain().
  * Reverse disguise: upstream registers TWO hash entries per rule (susfs.c:844-863), the second with
  * reversed_lookup_only = true and the two pathnames swapped, and every "where did this file come from" reporter answers
@@ -17,14 +24,15 @@
  * susfs_is_current_proc_umounted_app(), never the rule's uid_scheme - so even a scheme-0 rule is disguised for app
  * processes (or_reverse_visible() keeps that gate through susfs_is_current_proc_umounted_app()).
  * Reachability: none of those five is reachable from an LKM here (the first two and seq_show() are static; the
- * maps/fdinfo numbers are locals a kprobe cannot see).  Covered instead: point the caller at the *target's* path
- * (d_path(), vfs_statfs()), and where no shared helper exists rewrite the line the function already formatted, from a
- * kretprobe on its return - show_map_vma()'s line carries "maj:min ino" AND the name, both from the redirected file,
- * and the name cannot be reached that way (seq_file_path() -> seq_path() -> __d_path() is LTO-inlined: a probe on it
- * registers and never fires - measured).
- * Never silent: registration outcome and hit counts are logged and shown by /proc/susfs_open_redirect, because
- * registering only proves the symbol exists - this feature has hit that wall twice (show_vma_header_prefix, then
- * __d_path: both registered, both stayed at 0).
+ * maps/fdinfo numbers are locals a kprobe cannot see).  Covered instead: d_path() and vfs_statfs() are kretprobed and
+ * answer from the rule snapshot (both take the redirected file's dentry, so a return probe can replace what they
+ * rendered - d_path() keeps its caller-supplied buffer, hence the rewrite rather than an argument swap), and where no
+ * shared helper exists the line the function already formatted is rewritten the same way - show_map_vma()'s line
+ * carries "maj:min ino" AND the name, both from the redirected file, and the name cannot be reached that way
+ * (seq_file_path() -> seq_path() -> __d_path() is LTO-inlined: a probe on it registers and never fires - measured).
+ * Never silent: registration outcome, entry-hook state and hit counts are logged and shown by
+ * /proc/susfs_open_redirect, because registering only proves the symbol exists - this feature has hit that wall twice
+ * (show_vma_header_prefix, then __d_path: both registered, both stayed at 0).
  *
  * /proc/susfs_open_redirect: add_open_redirect <target> <redirected> <uid_scheme> | del <target> | clear
  */
@@ -39,6 +47,8 @@
 #include <linux/uaccess.h>
 #include "mount.h"		/* fs/mount.h: real_mount() -> mnt_id */
 #include <linux/atomic.h>	/* reverse-disguise hit counters */
+#include <linux/rcupdate.h>	/* the entry hook's match runs under rcu_read_lock, like the probes */
+#include <linux/statfs.h>	/* struct kstatfs: the snapshot the reverse statfs face answers from */
 #include <linux/mm.h>		/* struct vm_area_struct (the maps reverse face) */
 #include <linux/kdev_t.h>	/* MAJOR/MINOR, to render dev:ino the way proc does */
 #include <linux/kernel.h>	/* scnprintf, for the same rendering */
@@ -48,7 +58,9 @@
 #include "susfs.h"		/* susfs_expose_proc, sus_path_lsm_active */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact */
 #include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
+#include "ksu_allow_gate.h"	/* the control-node gate is su's own */
 #include "susfs_kprobe.h"
+#include "susfs_or_entry.h"	/* susfs_or_entry_armed(): the forward direction lives there now */
 
 #define SUS_OR_MAX 64
 /* The ABI fields are char[256]; matching that width stops a legal long path from being truncated into a rule for a
@@ -83,6 +95,20 @@ static u32 or_su_sid;
  * validates the type hash at a call through a function pointer. */
 static void (*or_cred_getsecid)(const struct cred *cred, u32 *secid);
 
+/* vfs_statfs, resolved by name: add time takes the target's statfs snapshot with it, and once the
+ * entry holds no path that snapshot is the reverse statfs face's only source for those numbers. */
+static int (*or_vfs_statfs_fn)(const struct path *path, struct kstatfs *buf);
+
+/* The one indirect call into the kernel this file still makes, in its own __nocfi noinline function: a checked indirect
+ * call to a kernel symbol is a CFI panic rather than an error return, and or_add() must stay checkable (the
+ * cfi_sites.py gate looks for exactly this, including a helper that LTO inlined back into a caller without __nocfi). */
+static __nocfi noinline int or_statfs_snapshot(const struct path *path, struct kstatfs *out)
+{
+	if (!or_vfs_statfs_fn)
+		return -EOPNOTSUPP;
+	return or_vfs_statfs_fn(path, out);
+}
+
 struct sus_or_entry {
 	char target_pathname[OR_PATH_MAX];
 	char redirected_pathname[OR_PATH_MAX];
@@ -91,13 +117,22 @@ struct sus_or_entry {
 	/* Reverse direction: the redirected inode is the lookup key, and target_path is what the reporters above show instead. */
 	unsigned long redirected_ino;
 	dev_t redirected_dev;
+	/* Inode generation, both directions.  A rule keeps numbers instead of references now, and numbers
+	 * are reused: delete a redirected file and create another one on the same filesystem and the new
+	 * file can land on the old inode number, at which point the rule would hijack an unrelated file.
+	 * i_generation is what tells a reused number apart from the object the rule was registered for
+	 * (the same field NFS export handles use).  Filesystems that do not maintain it report 0, which
+	 * compares equal to itself - i.e. on those this is no worse than matching the number alone. */
+	unsigned int target_igen;
+	unsigned int redirected_igen;
 	/* Reverse direction, second number: fdinfo also prints mnt_id, and for the redirected file that is the mount the
 	 * redirection really opened - which can differ from the target's (e.g. /system/etc/hosts vs
 	 * /data/local/tmp/hosts).  Cached at add time: the reporter has only numbers to work with. */
 	unsigned long target_mnt_id;
-	/* Cached at add time, base references held for the entry's lifetime. */
-	struct path target_path;
-	struct path redirected_path;
+	/* Snapshot taken at add time with vfs_statfs(), which the reverse statfs face answers from.
+	 * Nothing in this entry holds a reference of any kind - no dentry, no mount, no inode - and
+	 * that is what keeps a rule from pinning a filesystem in place. */
+	struct kstatfs spoofed_kstatfs;
 	int uid_scheme;
 	/* Set while the slot is being rewritten or has been deleted.  The reader checks this with
 	 * READ_ONCE and the writer clears it LAST, so false means the rest of the entry is complete. */
@@ -105,7 +140,16 @@ struct sus_or_entry {
 };
 
 static struct sus_or_entry or_entries[SUS_OR_MAX];
-static int nor;
+static int nor;		/* highest index ever handed out, plus one: the scan bound */
+/* Slots that were handed out and have been taken back (or_reclaim_slot()).  A slot returns here once
+ * a grace period has passed, which is what turns the UPPER BOUND into "how many rules exist at the
+ * same time" instead of "how many times a rule was ever added". */
+static unsigned int or_free[SUS_OR_MAX];
+static unsigned int or_free_n;
+/* How many rules are live right now, which is what the name-layer hook reads before it resolves anything: the hook runs
+ * for every open() on the system, so a table that once had a rule must not keep costing a path lookup after that rule
+ * was deleted.  Written under or_lock, read locklessly (susfs.h states the contract). */
+unsigned int susfs_open_redirect_rules;
 static DEFINE_MUTEX(or_lock);
 
 /* Reverse-disguise bookkeeping.  The counters are the only way to tell a hook that never fires from one that fires and
@@ -114,12 +158,10 @@ static DEFINE_MUTEX(or_lock);
 static atomic_t or_rev_dpath_hits = ATOMIC_INIT(0);
 static atomic_t or_rev_statfs_hits = ATOMIC_INIT(0);
 
-/* Cached paths are per-entry, released once at unload (file-level note on the rule array).  The handlers run in interrupt
- * context with no lock and hand &e->redirected_path / &e->target_path straight to vfs_open()/d_path()/vfs_statfs(), which
- * read or path_get() it, so freeing an old path on replace/delete raced a concurrent open into a use-after-free (upstream
- * avoids that with SRCU plus a re-walk).  A "retired paths" side list was tried and removed: it duplicated the struct
- * path - one reference, two owners - so unload released it twice and the device died on rmmod.  A deleted rule keeps its
- * paths: dead entries are never reused, stay out of every lookup, and exit releases them. */
+/* No release path for a rule's FILES, because an entry holds no reference to them: no dentry, no mount, no inode, only
+ * numbers, strings and the statfs snapshot (file-level note).  The SLOT a rule occupies does come back, though - see
+ * or_reclaim_slot(): a deleted rule's slot is handed out again after a grace period, which is what keeps the table from
+ * being a budget of "how many rules were ever added". */
 static void or_resolve_su_sid(void)
 {
 	int err;
@@ -174,12 +216,18 @@ static bool or_uid_matches(int scheme)
 	case UID_NON_SU_PROC:			/* susfs.c:950-953 */
 		return !or_in_su_domain();
 	case UID_UMOUNTED_APP_PROC:		/* susfs.c:954-957 */
-	case UID_UMOUNTED_PROC:			/* susfs.c:958-961 */
-		/* Upstream: test_thread_flag(TIF_PROC_UMOUNTED) [&& uid >= 10000 for the _APP variant] (susfs_def.h:98-125).  The
-		 * flag is set by the SUSFS-patched KernelSU, so both schemes ask KernelSU the same question here
-		 * (susfs_is_current_proc_umounted_app(), ksu_umount_gate.h, issue #34) and still degenerate into one predicate - a
-		 * strictly narrower gate than scheme 2, as upstream's flag is. */
+		/* Upstream: TIF_PROC_UMOUNTED && uid >= 10000 (susfs_def.h:122-125).  The flag is set
+		 * by the SUSFS-patched KernelSU and this kernel has no such patch, so the same
+		 * question is put to KernelSU by uid instead (ksu_umount_gate.h, issue #34).  What
+		 * that substitution cannot reproduce is the flag's per-THREAD grain: a process of an
+		 * umounted uid that was not forked from zygote answers yes here and no upstream. */
 		return susfs_is_current_proc_umounted_app();
+	case UID_UMOUNTED_PROC:			/* susfs.c:958-961 */
+		/* Upstream: TIF_PROC_UMOUNTED alone, with no uid condition at all - which is how it
+		 * covers init-derived processes.  Same substitution as above, and the uid half is
+		 * deliberately NOT added here: that is the whole difference between this scheme and
+		 * the one above. */
+		return susfs_is_current_proc_umounted();
 	default:				/* susfs.c:962-963 */
 		return false;
 	}
@@ -189,7 +237,7 @@ static struct sus_or_entry *or_find_by_path(const char *target)
 {
 	int i;
 
-	for (i = 0; i < nor; i++) {
+	for (i = 0; i < READ_ONCE(nor); i++) {
 		if (READ_ONCE(or_entries[i].dead))
 			continue;
 		if (!strcmp(or_entries[i].target_pathname, target))
@@ -198,34 +246,66 @@ static struct sus_or_entry *or_find_by_path(const char *target)
 	return NULL;
 }
 
-static struct sus_or_entry *or_find_by_inode(unsigned long ino, dev_t dev)
+static struct sus_or_entry *or_find_by_inode(unsigned long ino, dev_t dev, unsigned int gen)
 {
 	int i;
 
-	for (i = 0; i < nor; i++) {
+	for (i = 0; i < READ_ONCE(nor); i++) {
 		/* dead is cleared LAST by the writer, so skipping dead entries also skips any entry whose
 		 * fields are still being written. */
 		if (READ_ONCE(or_entries[i].dead))
 			continue;
 		smp_rmb();
 		if (or_entries[i].target_ino == ino &&
-		    or_entries[i].target_dev == dev)
+		    or_entries[i].target_dev == dev &&
+		    or_entries[i].target_igen == gen)
 			return &or_entries[i];
 	}
 	return NULL;
 }
 
+/* The name-layer entry hook asks this one, with the path the caller is about to open: true when a live
+ * rule redirects that inode, in which case the rule's redirect target has been copied into `buf`.
+ *
+ * The copy happens under rcu_read_lock and is mandatory, not politeness: a slot is recycled once a
+ * grace period has passed after the rule was deleted (or_reclaim_slot()), so a pointer into an
+ * entry may not be used after the lookup returns.  A name that does not fit leaves buf alone and
+ * counts as "no rule" - the caller then runs the original syscall, which is always correct.
+ * The table read is lockless for the same reason the probes' is: `dead` is cleared LAST by the
+ * writer, so a non-dead entry has complete fields. */
+bool susfs_open_redirect_match_path(const struct path *path, char *buf, size_t buflen)
+{
+	struct inode *inode;
+	struct sus_or_entry *e;
+	bool hit = false;
+
+	if (!READ_ONCE(nor) || !path->dentry)
+		return false;
+	inode = d_inode(path->dentry);
+	if (!inode)
+		return false;
+
+	rcu_read_lock();
+	e = or_find_by_inode(inode->i_ino, inode->i_sb->s_dev, inode->i_generation);
+	if (e && or_uid_matches(e->uid_scheme) && e->redirected_pathname[0] &&
+	    strscpy(buf, e->redirected_pathname, buflen) >= 0)
+		hit = true;
+	rcu_read_unlock();
+	return hit;
+}
+
 /* Reverse direction: keyed on the redirected (really opened) inode, published like or_find_by_inode(). */
-static struct sus_or_entry *or_find_by_redirected_inode(unsigned long ino, dev_t dev)
+static struct sus_or_entry *or_find_by_redirected_inode(unsigned long ino, dev_t dev, unsigned int gen)
 {
 	int i;
 
-	for (i = 0; i < nor; i++) {
+	for (i = 0; i < READ_ONCE(nor); i++) {
 		if (READ_ONCE(or_entries[i].dead))
 			continue;
 		smp_rmb();
 		if (or_entries[i].redirected_ino == ino &&
-		    or_entries[i].redirected_dev == dev)
+		    or_entries[i].redirected_dev == dev &&
+		    or_entries[i].redirected_igen == gen)
 			return &or_entries[i];
 	}
 	return NULL;
@@ -233,16 +313,22 @@ static struct sus_or_entry *or_find_by_redirected_inode(unsigned long ino, dev_t
 
 /* Reverse direction for the one caller that has only numbers: /proc/<pid>/fdinfo/N prints "mnt_id:\t<i>" and "ino:\t<j>"
  * for the file an fd points at and no device, so this lookup is by ino alone; two rules sharing that ino refuses to
- * answer (a missed disguise beats disguising an unrelated file).  On success: the target's ino and mount id (0 unknown). */
+ * answer (a missed disguise beats disguising an unrelated file).  On success: the target's ino and mount id (0 unknown).
+ * Only the inode number is available here, so unlike the other lookups this one cannot also compare i_generation - a
+ * number that a filesystem reused stays indistinguishable from this caller's point of view. */
 bool susfs_open_redirect_spoof_ids(unsigned long ino, unsigned long *out_ino,
 				   unsigned long *out_mnt_id)
 {
 	struct sus_or_entry *e = NULL;
 	int i, hits = 0;
+	unsigned long tino = 0, tmnt = 0;
 
 	if (!ino || !out_ino || !or_reverse_visible())
 		return false;
-	for (i = 0; i < nor; i++) {
+	/* The numbers are copied out inside the rcu section: rule slots are recycled after a grace
+	 * period (or_reclaim_slot()), so an entry may not be read after this function returns. */
+	rcu_read_lock();
+	for (i = 0; i < READ_ONCE(nor); i++) {
 		if (READ_ONCE(or_entries[i].dead))
 			continue;
 		smp_rmb();
@@ -250,13 +336,18 @@ bool susfs_open_redirect_spoof_ids(unsigned long ino, unsigned long *out_ino,
 			continue;
 		e = &or_entries[i];
 		if (++hits > 1)
-			return false;
+			break;
 	}
+	if (hits == 1) {
+		tino = e->target_ino;
+		tmnt = e->target_mnt_id;
+	}
+	rcu_read_unlock();
 	if (hits != 1)
 		return false;
-	*out_ino = e->target_ino;
+	*out_ino = tino;
 	if (out_mnt_id)
-		*out_mnt_id = e->target_mnt_id;
+		*out_mnt_id = tmnt;
 	return true;
 }
 
@@ -266,7 +357,7 @@ static bool or_is_redirected_path(const char *target)
 {
 	int i;
 
-	for (i = 0; i < nor; i++) {
+	for (i = 0; i < READ_ONCE(nor); i++) {
 		if (READ_ONCE(or_entries[i].dead))
 			continue;
 		if (!strcmp(or_entries[i].redirected_pathname, target))
@@ -275,84 +366,113 @@ static bool or_is_redirected_path(const char *target)
 	return false;
 }
 
-/* ---- forward: vfs_open(path, file) - swap the path on match ----
- * Runs in interrupt context: no sleeping, no kern_path here.  Upstream leaves the lookup loop entirely when the inode
- * matches but the scheme does not (goto out_srcu_read_unlock, susfs.c:945/949/953/957/961), so there a non-matching
- * entry also suppresses the remaining same-inode entries; here the first live (ino, dev) match is the only candidate -
- * the same outcome for distinct inodes, while rules sharing one inode (hard links) differ only in which entry wins
- * (upstream: newest hash_add_rcu first, here: slot order). */
-static int or_vfs_open_pre(struct kprobe *kp, struct pt_regs *regs)
-{
-	const struct path *path = (const struct path *)regs->regs[0];
-	struct inode *inode;
-	struct sus_or_entry *e;
-
-	/* IS_ERR_OR_NULL on the same principle as the sus_path name handlers: a kprobe runs before the
-	 * callee, so a caller that leaves argument checking to it hands us an error pointer. */
-	if (IS_ERR_OR_NULL(path) || !path->dentry)
-		return 0;
-	inode = d_backing_inode(path->dentry);
-	if (!inode)
-		return 0;
-
-	e = or_find_by_inode(inode->i_ino, inode->i_sb->s_dev);
-	if (!e)
-		return 0;
-	if (!or_uid_matches(e->uid_scheme))
-		return 0;
-
-	/* vfs_open does file->f_path = *path; do_dentry_open path_get()s it. */
-	regs->regs[0] = (unsigned long)&e->redirected_path;
-	return 0;
-}
+/* ---- forward: not here any more (kernel/susfs_or_entry.c) ----
+ * The vfs_open face worked by replacing the path argument with a cached target path, which meant every rule had to keep a
+ * dentry and a mount reference alive - and those are exactly what keeps a filesystem from being unmounted while a rule
+ * points into it.  The same direction is done one layer up, at the NAME: the caller's own path is resolved with
+ * filename_lookup() (process context, before the syscall runs) and the target is opened with filp_open() and handed back
+ * as a fd.  Nothing is cached there either, so this file holds no reference of any kind any more: what remains are the
+ * numbers, the snapshot, the two names, and the three reverse faces below.
+ * Matching note that survives the move: upstream leaves the lookup loop entirely when the inode matches but the scheme
+ * does not (goto out_srcu_read_unlock, susfs.c:945/949/953/957/961), so there a non-matching entry also suppresses the
+ * remaining same-inode entries; here the first live (ino, dev) match is the only candidate - the same outcome for
+ * distinct inodes, while rules sharing one inode (hard links) differ only in which entry wins (upstream: newest
+ * hash_add_rcu first, here: slot order). */
 
 /* ---- reverse: d_path(path, buf, buflen) ----
  * Covers readlink("/proc/<pid>/fd/N"): proc_pid_readlink() -> do_proc_readlink() -> d_path(&path, tmp, PAGE_SIZE)
- * (fs/proc/base.c, upstream: patch:1062-1083).  Divergence: upstream replays the literal string given at add time, while
- * d_path() renders the canonical name of the cached target path in the *reader's* namespace - a rule registered through a
- * symlink (or another mount namespace) can read back differently.
+ * (fs/proc/base.c, upstream: patch:1062-1083).  Upstream replays the literal string given at add time, and so does this
+ * now: the path argument is left alone and the name d_path() produced is rewritten in the return probe.
+ *
  * The /proc/<pid>/maps NAME column is NOT here: show_map_vma() prints it with seq_file_path() -> seq_path(), which calls
  * __d_path() directly, never d_path() (fs/seq_file.c); a probe on __d_path registers cleanly and never fires here (full
  * LTO inlines the primitive; measured dpath_seq=0 while the maps line still named the redirected file), so the name is
  * rewritten out of the already-printed line - see or_maps_ret(). */
-static bool or_dpath_swap(struct pt_regs *regs)
+struct or_dpath_args {
+	char *buf;
+	int buflen;
+	/* The name is COPIED here in the entry handler, not pointed at: rule slots are recycled after a
+	 * grace period (or_reclaim_slot()), and the return handler runs long after the entry handler
+	 * returned - with no rcu_read_lock in between to cover a slot being handed out again. */
+	char target[OR_PATH_MAX];
+};
+
+static int or_dpath_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	const struct path *path = (const struct path *)regs->regs[0];
+	struct or_dpath_args *a = (struct or_dpath_args *)ri->data;
 	struct inode *inode;
 	struct sus_or_entry *e;
+	bool hit = false;
 
+	a->target[0] = '\0';
 	if (!READ_ONCE(nor) || IS_ERR_OR_NULL(path) || !path->dentry)
-		return false;
+		return 0;
 	if (!or_reverse_visible())
-		return false;
+		return 0;
 	inode = d_backing_inode(path->dentry);
 	if (!inode)
-		return false;
+		return 0;
 
-	e = or_find_by_redirected_inode(inode->i_ino, inode->i_sb->s_dev);
-	if (!e)
-		return false;
+	/* The lookup and the copy are one rcu section: that is what makes it safe for or_del() to
+	 * recycle the slot afterwards (see or_reclaim_slot()). */
+	rcu_read_lock();
+	e = or_find_by_redirected_inode(inode->i_ino, inode->i_sb->s_dev, inode->i_generation);
+	if (e && e->target_pathname[0] &&
+	    strscpy(a->target, e->target_pathname, sizeof(a->target)) >= 0)
+		hit = true;
+	rcu_read_unlock();
+	if (!hit)
+		return 0;
 
-	regs->regs[0] = (unsigned long)&e->target_path;
-	return true;
+	a->buf = (char *)regs->regs[1];
+	a->buflen = (int)regs->regs[2];
+	atomic_inc(&or_rev_dpath_hits);
+	return 0;
 }
 
-static int or_dpath_pre(struct kprobe *kp, struct pt_regs *regs)
+static int or_dpath_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-	if (or_dpath_swap(regs))
-		atomic_inc(&or_rev_dpath_hits);
+	const struct or_dpath_args *a = (const struct or_dpath_args *)ri->data;
+	char *ret;
+
+	if (!a->target[0] || !a->buf || a->buflen <= 0)
+		return 0;
+	ret = (char *)regs->regs[0];
+	if (IS_ERR(ret))
+		return 0;		/* d_path failed: keep the error the caller expects */
+	/* Checked before writing: strscpy() truncates by filling the whole buffer and NUL-terminating
+	 * its last byte, so "it did not fit" would still have destroyed the name the kernel produced.
+	 * A target name that long leaves that name alone instead. */
+	if (strnlen(a->target, (size_t)a->buflen) >= (size_t)a->buflen)
+		return 0;
+	strscpy(a->buf, a->target, (size_t)a->buflen);
+	/* d_path() may return a pointer into the middle of the buffer (it trims a leading " (deleted)"); the rewritten name
+	 * starts at buf, so the return value has to move with it or the caller reads from the wrong offset. */
+	regs->regs[0] = (unsigned long)a->buf;
 	return 0;
 }
 
 /* ---- reverse: vfs_statfs(path, buf) ----
- * Upstream answers statfs()/fstatfs() of the redirected file with the target's kstatfs snapshot (susfs.c:1029-1046, taken
- * with vfs_statfs() at add time, susfs.c:851); swapping in the cached target path computes the same from the live target. */
-static int or_vfs_statfs_pre(struct kprobe *kp, struct pt_regs *regs)
+ * Upstream answers statfs()/fstatfs() of the redirected file with the target's kstatfs snapshot, taken with vfs_statfs()
+ * at add time (susfs.c:1029-1046, susfs.c:851).  This does the same instead of swapping in a cached target path: the
+ * snapshot is copied into the return-probe data and written over the caller's buffer, so there is no target path to
+ * hold - which is what used to keep a filesystem busy while a rule pointed into it. */
+struct or_statfs_args {
+	struct kstatfs *buf;	/* the caller's buffer, taken in the ENTRY probe - see or_statfs_entry() */
+	struct kstatfs kstatfs;
+	bool hit;
+};
+
+static int or_statfs_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	const struct path *path = (const struct path *)regs->regs[0];
+	struct or_statfs_args *a = (struct or_statfs_args *)ri->data;
 	struct inode *inode;
 	struct sus_or_entry *e;
 
+	a->hit = false;
+	a->buf = NULL;
 	if (!READ_ONCE(nor) || IS_ERR_OR_NULL(path) || !path->dentry)
 		return 0;
 	if (!or_reverse_visible())
@@ -361,29 +481,58 @@ static int or_vfs_statfs_pre(struct kprobe *kp, struct pt_regs *regs)
 	if (!inode)
 		return 0;
 
-	e = or_find_by_redirected_inode(inode->i_ino, inode->i_sb->s_dev);
-	if (!e)
+	/* One rcu section for the lookup and the snapshot copy: rule slots are recycled after a grace
+	 * period (or_reclaim_slot()), so nothing inside an entry may be read outside it. */
+	rcu_read_lock();
+	e = or_find_by_redirected_inode(inode->i_ino, inode->i_sb->s_dev, inode->i_generation);
+	if (!e) {
+		rcu_read_unlock();
 		return 0;
+	}
 
+	/* Second argument of vfs_statfs().  Read HERE, not in the return probe: a return probe only has the return value,
+	 * the argument registers belong to whatever the callee last did with them (measured on 5.15 - the rewrite went to
+	 * a stale x1 and userspace kept seeing the redirected file's own numbers). */
+	a->buf = (struct kstatfs *)regs->regs[1];
+	if (!susfs_ptr_plausible(a->buf)) {
+		rcu_read_unlock();
+		return 0;
+	}
+
+	/* The snapshot is copied here as well, not in the return probe: the entry could be rewritten in between, and the
+	 * copy is what the caller's buffer will be filled from, so it has to be one consistent moment. */
+	a->kstatfs = e->spoofed_kstatfs;
+	rcu_read_unlock();
+	a->hit = true;
 	atomic_inc(&or_rev_statfs_hits);
-	regs->regs[0] = (unsigned long)&e->target_path;
 	return 0;
 }
 
-static struct kprobe kp_or = {
-	.symbol_name = "vfs_open",
-	.pre_handler = or_vfs_open_pre,
+static int or_statfs_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+	const struct or_statfs_args *a = (const struct or_statfs_args *)ri->data;
+
+	if (!a->hit || !a->buf || (long)regs->regs[0] != 0)
+		return 0;		/* the kernel refused the statfs: its answer stands */
+	*a->buf = a->kstatfs;
+	return 0;
+}
+
+static struct kretprobe kr_or_dpath = {
+	.kp.symbol_name = "d_path",
+	.entry_handler = or_dpath_entry,
+	.handler = or_dpath_ret,
+	.data_size = sizeof(struct or_dpath_args),
+	.maxactive = 16,
 };
 
-static struct kprobe kp_or_dpath = {
-	.symbol_name = "d_path",
-	.pre_handler = or_dpath_pre,
-};
 
-
-static struct kprobe kp_or_vfs_statfs = {
-	.symbol_name = "vfs_statfs",
-	.pre_handler = or_vfs_statfs_pre,
+static struct kretprobe kr_or_vfs_statfs = {
+	.kp.symbol_name = "vfs_statfs",
+	.entry_handler = or_statfs_entry,
+	.handler = or_statfs_ret,
+	.data_size = sizeof(struct or_statfs_args),
+	.maxactive = 16,
 };
 
 /* ---- reverse face 3: the dev:ino columns of /proc/<pid>/maps (and smaps) ----
@@ -459,9 +608,15 @@ static int or_maps_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (!inode)
 		return 0;
 
-	e = or_find_by_redirected_inode(inode->i_ino, inode->i_sb->s_dev);
-	if (!e)
+	/* One rcu section around the lookup and everything read from the entry: rule slots are recycled
+	 * after a grace period (or_reclaim_slot()), so nothing inside an entry may be touched outside
+	 * this section.  Nothing here sleeps - the two buffer rewrites below are memmove/memcpy. */
+	rcu_read_lock();
+	e = or_find_by_redirected_inode(inode->i_ino, inode->i_sb->s_dev, inode->i_generation);
+	if (!e) {
+		rcu_read_unlock();
 		return 0;
+	}
 
 	atomic_inc(&or_rev_maps_hits);
 
@@ -492,6 +647,7 @@ static int or_maps_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 				   e->target_pathname, tlen))
 			atomic_inc(&or_rev_maps_names);
 	}
+	rcu_read_unlock();
 	return 0;
 }
 
@@ -525,7 +681,9 @@ static int or_fdinfo_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 }
 
 /* Find `label` in the already formatted buffer and parse the decimal that follows it; false when
- * the label is absent or has no digits. */
+ * the label is absent or has no digits.  procfs prints inode and mount ids as unsigned long, so
+ * keep the full native width here instead of the 32-bit limit that hid large inode numbers from
+ * the rewrite. */
 static bool or_fdinfo_find_dec(struct seq_file *m, const char *label, size_t label_len,
 			       size_t *out_pos, size_t *out_len, unsigned long *out_val)
 {
@@ -541,7 +699,7 @@ static bool or_fdinfo_find_dec(struct seq_file *m, const char *label, size_t lab
 	}
 	if (!pos)
 		return false;
-	while (pos + len < count && len < 10 &&
+	while (pos + len < count && len < sizeof(unsigned long) * 3 &&
 	       buf[pos + len] >= '0' && buf[pos + len] <= '9') {
 		v = v * 10 + (unsigned long)(buf[pos + len] - '0');
 		len++;
@@ -560,9 +718,9 @@ static bool or_fdinfo_find_dec(struct seq_file *m, const char *label, size_t lab
 static bool or_fdinfo_write_dec(struct seq_file *m, size_t pos, size_t len,
 				unsigned long new_val)
 {
-	char digits[12];
+	char digits[sizeof(unsigned long) * 3];
 	size_t count = m->count, i, n = 0;
-	unsigned int v = (unsigned int)new_val;
+	unsigned long v = new_val;
 
 	while (v) {
 		digits[n++] = (char)('0' + v % 10);
@@ -596,6 +754,14 @@ static int or_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 		return 0;
 	if (!m->buf || !m->count)
 		return 0;
+	/* Only fdinfo's own file is rewritten, and above 5.15 this probe sits on ALL FOUR functions
+	 * named seq_show (see kr_or_fdinfo[]): the file being read is m->file, and
+	 * /proc/<pid>/fdinfo/<fd> (and .../task/<tid>/fdinfo/<fd>) has a dentry whose parent is named
+	 * "fdinfo".  The "ino:\t" / "mnt_id:\t" label tests below already make the scan a no-op for
+	 * another file; this keeps it off other files' buffers in the first place. */
+	if (!m->file || !m->file->f_path.dentry || !m->file->f_path.dentry->d_parent ||
+	    strcmp(m->file->f_path.dentry->d_parent->d_name.name, "fdinfo") != 0)
+		return 0;
 	if (!or_reverse_visible())
 		return 0;
 
@@ -620,37 +786,44 @@ static int or_fdinfo_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 	return 0;
 }
 
-static struct kretprobe kr_or_fdinfo = {
-	.kp.symbol_name = "seq_show",		/* fs/proc/fd.c */
-	.entry_handler = or_fdinfo_entry,
-	.handler = or_fdinfo_ret,
-	.data_size = sizeof(struct seq_file *),
-	.maxactive = 16,
-};
-static bool or_fdinfo_registered;
+/* fs/proc/fd.c's fdinfo callback is reached through single_open(file, seq_show, inode): no table
+ * holds its address, so it can only be found by name - and ABOVE 5.15 THE NAME IS NOT UNIQUE.  The
+ * DDK trees carry four symbols called exactly `seq_show` on android14-6.1 and android15-6.6 (one on
+ * 5.10/5.15), and register_kprobe(.symbol_name = ...) attaches to whichever kallsyms lists first.
+ * That is not a theoretical hazard: it is exactly how this rewrite silently stopped working in
+ * sus_mount on those kernels (mountinfo showed the disguised id while /proc/<pid>/fdinfo/N printed
+ * the real one - a one-file oracle), and the registration here was the same shape.  So enumerate
+ * every match and hook all of them; the return handler decides by the file it sees, which makes an
+ * unrelated seq_show cost one comparison and change nothing. */
+#define OR_FDINFO_MAX 8
+
+static struct kretprobe kr_or_fdinfo[OR_FDINFO_MAX];
+static int n_or_fdinfo_probes;
 
 static bool or_registered;
 static bool or_dpath_registered;
 static bool or_statfs_registered;
 
-/* The forward hook is the feature: a rule that cannot fire is worse than no rule, so its
- * registration failure is reported to the caller. */
+/* Set by susfs_open_redirect_exit() while it holds or_lock; registration refuses afterwards.
+ * The /proc node does NOT hold a module reference (proc_create(..., NULL, ...) takes no owner),
+ * so a write that is already inside or_proc_write() can reach or_register() while the module is
+ * being torn down: without this flag the forward probe would be registered again after
+ * or_unregister() cleared or_registered, and its handler would outlive the module. */
+static bool or_exiting;
+
+/* The forward direction is the feature, but it is no longer a probe in this file: it lives at the name layer
+ * (kernel/susfs_or_entry.c, installed on the syscall entries).  A rule is useless if that layer is not armed - a rule that
+ * cannot fire is worse than no rule - so "arming" here means checking it, and the failure is reported to the caller. */
 static int or_register(void)
 {
-	int rc;
-
+	if (or_exiting)
+		return -ENODEV;
 	if (or_registered)
 		return 0;
-	rc = register_kprobe(&kp_or);
-	if (rc) {
-		/* Every later rule retries this registration, and a failure that happened after the
-		 * symbol was resolved leaves .addr set, so the retry would be refused with -EINVAL
-		 * and the forward hook - the feature - could never come up - see susfs_kprobe.h. */
-		susfs_kp_forget_addr(&kp_or);
-		return rc;
-	}
+	if (!susfs_or_entry_armed())
+		return -ENODEV;
 	or_registered = true;
-	SUSFS_LOGI("susfs_open_redirect: hook installed (vfs_open)\n");
+	SUSFS_LOGI("susfs_open_redirect: forward direction is the name layer (armed)\n");
 	return 0;
 }
 
@@ -662,11 +835,14 @@ static void or_register_reverse(void)
 {
 	int rc;
 
+	if (or_exiting)
+		return;
+
 	if (!or_dpath_registered) {
-		rc = register_kprobe(&kp_or_dpath);
+		rc = register_kretprobe(&kr_or_dpath);
 		if (rc) {
-			susfs_kp_forget_addr(&kp_or_dpath);
-			pr_warn("open_redirect: register_kprobe(d_path) failed %d - readlink not disguised (or already inlined)\n",
+			susfs_krp_forget_addr(&kr_or_dpath);
+			pr_warn("open_redirect: register_kretprobe(d_path) failed %d - readlink not disguised (or already inlined)\n",
 				rc);
 		} else {
 			or_dpath_registered = true;
@@ -675,10 +851,10 @@ static void or_register_reverse(void)
 	}
 
 	if (!or_statfs_registered) {
-		rc = register_kprobe(&kp_or_vfs_statfs);
+		rc = register_kretprobe(&kr_or_vfs_statfs);
 		if (rc) {
-			susfs_kp_forget_addr(&kp_or_vfs_statfs);
-			pr_warn("open_redirect: register_kprobe(vfs_statfs) failed %d - statfs not disguised (or already inlined)\n",
+			susfs_krp_forget_addr(&kr_or_vfs_statfs);
+			pr_warn("open_redirect: register_kretprobe(vfs_statfs) failed %d - statfs not disguised (or already inlined)\n",
 				rc);
 		} else {
 			or_statfs_registered = true;
@@ -696,25 +872,55 @@ static void or_register_reverse(void)
 			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (show_map_vma)\n");
 		}
 	}
-	if (!or_fdinfo_registered) {
-		rc = register_kretprobe(&kr_or_fdinfo);
-		if (rc) {
-			susfs_krp_forget_addr(&kr_or_fdinfo);
-			pr_warn("open_redirect: register_kretprobe(seq_show) failed %d - fdinfo names the redirected inode\n",
-				rc);
-		} else {
-			or_fdinfo_registered = true;
-			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (seq_show/fdinfo)\n");
+	if (!n_or_fdinfo_probes) {
+		unsigned long addrs[OR_FDINFO_MAX];
+		int i, n;
+
+		/* Every symbol with this name - see kr_or_fdinfo[] for why one is not enough. */
+		n = ksu_find_symbol_all("seq_show", addrs, OR_FDINFO_MAX);
+		if (n <= 0)
+			pr_warn("open_redirect: seq_show not resolved - fdinfo names the redirected inode\n");
+		for (i = 0; i < n; i++) {
+			struct kretprobe *kr = &kr_or_fdinfo[i];
+
+			kr->kp.addr = (void *)addrs[i];
+			kr->entry_handler = or_fdinfo_entry;
+			kr->handler = or_fdinfo_ret;
+			kr->data_size = sizeof(struct seq_file *);
+			kr->maxactive = 16;
+			rc = register_kretprobe(kr);
+			if (rc) {
+				pr_warn("open_redirect: register_kretprobe(seq_show @%px) failed %d\n",
+					(void *)addrs[i], rc);
+				susfs_krp_forget_addr(kr);
+				continue;
+			}
+			n_or_fdinfo_probes++;
 		}
+		if (n_or_fdinfo_probes)
+			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (seq_show/fdinfo on %d/%d symbol(s))\n",
+				   n_or_fdinfo_probes, n);
+		else
+			pr_warn("open_redirect: no seq_show kretprobe could be registered - fdinfo names the redirected inode\n");
 	}
 }
 
+/* Caller MUST hold or_lock: disarming outside it is what let a concurrent or_register() put the
+ * probes back after they were removed - and those probes would then point into a module that is
+ * about to be freed.  susfs_open_redirect_exit() takes the lock and sets or_exiting before it
+ * calls this, so no registration can slip in between. */
 static void or_unregister(void)
 {
-	if (or_fdinfo_registered) {
-		unregister_kretprobe(&kr_or_fdinfo);
-		susfs_krp_forget_addr(&kr_or_fdinfo);
-		or_fdinfo_registered = false;
+	{
+		int i;
+
+		for (i = 0; i < OR_FDINFO_MAX; i++) {
+			if (!kr_or_fdinfo[i].kp.addr)
+				continue;
+			unregister_kretprobe(&kr_or_fdinfo[i]);
+			susfs_krp_forget_addr(&kr_or_fdinfo[i]);
+		}
+		n_or_fdinfo_probes = 0;
 	}
 	if (or_maps_registered) {
 		unregister_kretprobe(&kr_or_maps);
@@ -722,22 +928,20 @@ static void or_unregister(void)
 		or_maps_registered = false;
 	}
 	if (or_statfs_registered) {
-		unregister_kprobe(&kp_or_vfs_statfs);
-		susfs_kp_forget_addr(&kp_or_vfs_statfs);
+		unregister_kretprobe(&kr_or_vfs_statfs);
+		susfs_krp_forget_addr(&kr_or_vfs_statfs);
 		or_statfs_registered = false;
 	}
 	if (or_dpath_registered) {
-		unregister_kprobe(&kp_or_dpath);
-		susfs_kp_forget_addr(&kp_or_dpath);
+		unregister_kretprobe(&kr_or_dpath);
+		susfs_krp_forget_addr(&kr_or_dpath);
 		or_dpath_registered = false;
 	}
 
-	if (!or_registered)
-		return;
-	unregister_kprobe(&kp_or);
-	susfs_kp_forget_addr(&kp_or);
+	/* Nothing of the forward direction to take down: it is the name layer's hook pointer, cleared by
+	 * susfs_or_entry_exit() from this layer's exit before the reverse probes come down. */
 	or_registered = false;
-	SUSFS_LOGI("susfs_open_redirect: hook removed\n");
+	SUSFS_LOGI("susfs_open_redirect: hooks removed\n");
 }
 
 /* ---- /proc/susfs_open_redirect ---- */
@@ -758,14 +962,25 @@ static struct proc_dir_entry *or_proc_entry;
 
 int susfs_open_redirect_init(void)
 {
+	int i;
+
+	/* Every slot starts OUT of service.  The array is static, so a fresh slot would otherwise read
+	 * as dead == false - i.e. as a complete rule - and a lockless reader scans up to `nor`, which
+	 * grows before its slot is filled.  With the flag raised here, "never used" and "reclaimed" are
+	 * the same state, or_add() can publish a slot by simply growing the bound, and no reader has to
+	 * order its load of `nor` against its load of `dead` (arm64 may reorder those two loads, so a
+	 * barrier in the writer would not have been enough - see the note in or_add()). */
+	for (i = 0; i < SUS_OR_MAX; i++)
+		WRITE_ONCE(or_entries[i].dead, true);
+
 	or_cred_getsecid =
 		(void *)find_kernel_symbol_exact("security_cred_getsecid");
 	if (!or_cred_getsecid)
 		pr_warn("open_redirect: security_cred_getsecid not found - schemes 1/2 will be refused\n");
 	or_resolve_su_sid();
 
-	/* Only the /proc node is optional.  The vfs_open hook is registered by or_add() - i.e. by the supercall as well - so
-	 * this gate must never return early and skip other work.  0777 so DAC passes and sus_path's LSM layer answers ENOENT;
+	/* Only the /proc node is optional.  This gate must never return early and skip other work: use_proc is a policy
+	 * switch, not a feature switch.  0777 so DAC passes and sus_path's LSM layer answers ENOENT;
 	 * without that layer the node would be world-writable, so it is not created at all (see susfs_kstat_init()). */
 	if (susfs_control_node_allowed()) {
 		or_proc_entry = proc_create("susfs_open_redirect", 0777, NULL,
@@ -777,8 +992,17 @@ int susfs_open_redirect_init(void)
 			(int)susfs_expose_proc, (int)sus_path_lsm_active());
 	}
 
-	SUSFS_LOGI("susfs_open_redirect: %d rules (hook %s, proc %d)\n", nor,
-		or_registered ? "armed" : "lazy", or_proc_entry != NULL);
+	/* The name layer is the forward direction now, so resolve what it needs and take the target's
+	 * statfs snapshot with it.  or_register() refuses a rule while it is not armed: a rule that
+	 * cannot fire is worse than no rule.  (The boolean is the layer's state, not or_registered:
+	 * that one only flips when the first rule is added, so it reads "lazy" before then.) */
+	or_vfs_statfs_fn = (void *)find_kernel_symbol_exact("vfs_statfs");
+	if (!or_vfs_statfs_fn)
+		pr_warn("open_redirect: vfs_statfs not found - the reverse statfs face will report a zeroed snapshot\n");
+	susfs_or_entry_init();
+
+	SUSFS_LOGI("susfs_open_redirect: %d rules (forward %s, proc %d)\n", nor,
+		susfs_or_entry_armed() ? "armed" : "unavailable", or_proc_entry != NULL);
 	return 0;
 }
 
@@ -786,24 +1010,33 @@ void susfs_open_redirect_exit(void)
 {
 	int i;
 
+	/* Stop being reachable from the syscall table first: the hook pointer is cleared before the
+	 * probes come down, so no entry that is still installed can call into this layer's exit. */
+	susfs_or_entry_exit();
+
+	/* "Stop accepting registrations" and "drop the probes" are one critical section: a /proc
+	 * write holds no module reference, so it can be sitting inside or_proc_write() right now,
+	 * and it would otherwise walk into or_register() after or_unregister() had cleared
+	 * or_registered - re-registering probes with handlers that outlive the module. */
+	mutex_lock(&or_lock);
+	or_exiting = true;
 	or_unregister();
+	mutex_unlock(&or_lock);
+
 	if (or_proc_entry) {
 		proc_remove(or_proc_entry);
 		or_proc_entry = NULL;
 	}
 
-	/* Nothing can reach these any more: the kprobes are already gone.  Every entry is released exactly once here - dead
-	 * ones included, which is what makes "a deleted rule keeps its paths" safe. */
-	for (i = 0; i < nor; i++) {
-		path_put(&or_entries[i].redirected_path);
-		or_entries[i].redirected_path.dentry = NULL;
-		or_entries[i].redirected_path.mnt = NULL;
-		path_put(&or_entries[i].target_path);
-		or_entries[i].target_path.dentry = NULL;
-		or_entries[i].target_path.mnt = NULL;
+	/* Nothing can reach these any more: the probes are already gone.  There is nothing to release
+	 * either - an entry holds numbers, a kstatfs snapshot and two strings, and the paths it parsed
+	 * when it was added were dropped right there.  This used to walk the table path_put()ing each
+	 * entry's cached struct path. */
+	for (i = 0; i < READ_ONCE(nor); i++)
 		or_entries[i].dead = true;
-	}
 	nor = 0;
+	or_free_n = 0;		/* nothing is left to hand out: every slot is dead again */
+	WRITE_ONCE(susfs_open_redirect_rules, 0);	/* the count the name layer reads; hook is already gone */
 }
 
 static int or_proc_show(struct seq_file *m, void *v)
@@ -811,10 +1044,10 @@ static int or_proc_show(struct seq_file *m, void *v)
 	int i;
 
 	mutex_lock(&or_lock);
-	if (nor == 0) {
+	if (!susfs_open_redirect_rules) {
 		seq_puts(m, "(empty)\n");
 	} else {
-		for (i = 0; i < nor; i++) {
+		for (i = 0; i < READ_ONCE(nor); i++) {
 			if (READ_ONCE(or_entries[i].dead))
 				continue;
 			seq_printf(m, "%s -> %s uid=%d (ino=%lu dev=%lu mnt=%lu | rev: ino=%lu dev=%lu)\n",
@@ -831,9 +1064,9 @@ static int or_proc_show(struct seq_file *m, void *v)
 	/* "registered" is not "reached": a hook whose counter stays 0 across a real read means GKI inlined its call sites
 	 * and that surface is NOT disguised - hence the counters below (fdinfo's surface and provenance are in the face-4
 	 * block above).  mnt_id is NOT rewritten here: that id belongs to sus_mount's table. */
-	seq_printf(m, "hooks: open=%d dpath=%d statfs=%d maps=%d fdinfo=%d | rev hits: dpath=%d statfs=%d maps=%d/%d/%d fdinfo=%d/%d | su_sid=%u\n",
-		   or_registered, or_dpath_registered, or_statfs_registered,
-		   or_maps_registered, or_fdinfo_registered,
+	seq_printf(m, "hooks: forward=%d dpath=%d statfs=%d maps=%d fdinfo=%d | rev hits: dpath=%d statfs=%d maps=%d/%d/%d fdinfo=%d/%d | su_sid=%u\n",
+		   susfs_or_entry_armed(), or_dpath_registered, or_statfs_registered,
+		   or_maps_registered, n_or_fdinfo_probes > 0,
 		   atomic_read(&or_rev_dpath_hits),
 		   atomic_read(&or_rev_statfs_hits),
 		   atomic_read(&or_rev_maps_hits),
@@ -850,7 +1083,7 @@ static int or_proc_open(struct inode *inode, struct file *file)
 {
 	/* 0777 is deliberate (the ENOENT contract comes from sus_path's hidden set, not from the mode), so refuse non-root
 	 * callers here too - see the note in susfs_enable_log.c's log_proc_open(). */
-	if (current_uid().val != 0)
+	if (!susfs_control_visible())
 		return -ENOENT;
 	return single_open(file, or_proc_show, NULL);
 }
@@ -874,11 +1107,14 @@ static int split_ws(char *buf, char **argv, int max)
 	return argc;
 }
 
+static void or_reclaim_slot(struct sus_or_entry *e);
+
 static int or_add(const char *target, const char *redirected, int scheme)
 {
 	struct sus_or_entry *e;
 	struct path tp, rp;
 	struct inode *ti, *ri;
+	struct kstatfs spoofed_kstatfs;
 	int rc;
 
 	/* upstream susfs.c:792-796 */
@@ -894,13 +1130,17 @@ static int or_add(const char *target, const char *redirected, int scheme)
 	rc = kern_path(target, LOOKUP_FOLLOW, &tp);
 	if (rc)
 		return rc;
+	/* The statfs snapshot the reverse face answers from, taken here while the target's path is in
+	 * hand.  The path itself is dropped before this function returns; only the snapshot stays. */
+	memset(&spoofed_kstatfs, 0, sizeof(spoofed_kstatfs));
+	(void)or_statfs_snapshot(&tp, &spoofed_kstatfs);
 	ti = d_backing_inode(tp.dentry);
 	if (!ti) {
 		path_put(&tp);
 		return -ENOENT;
 	}
 
-	/* resolve redirected and CACHE it (base ref kept for entry lifetime) */
+	/* resolve redirected; only its numbers are kept (nothing is cached any more) */
 	rc = kern_path(redirected, LOOKUP_FOLLOW, &rp);
 	if (rc) {
 		path_put(&tp);
@@ -960,54 +1200,147 @@ static int or_add(const char *target, const char *redirected, int scheme)
 		return -EINVAL;
 	}
 
-	/* Capacity is checked before the rewrite retires anything: with a full table, failing after the
-	 * WRITE_ONCE(e->dead, true) below would return -ENOSPC *and* silently kill the redirection that
-	 * was working.  A retired slot is never reused either: reuse would overwrite path fields a reader
-	 * may still hold and discard the reference the dead entry owns.  Rules are configuration, so the
-	 * array growing is fine. */
-	if (nor >= SUS_OR_MAX) {
+	/* Capacity is checked before anything is retired, so a full table cannot silently kill the rule
+	 * that was working: the only way to fail here is a NEW rule with no free slot and no unused slot
+	 * left.  Rewriting an existing rule takes the slot the rewrite releases, so it never fails on
+	 * capacity - see the reclaim below. */
+	if (!e && !or_free_n && nor >= SUS_OR_MAX) {
 		path_put(&rp);
 		path_put(&tp);
 		return -ENOSPC;
 	}
 
 	if (e) {
-		/* Rewriting a rule: mark the old entry dead and leave its paths alone - they stay for the module's life and
-		 * unload releases each entry exactly once.  or_del() says why those fields must not be cleared while a reader
-		 * may hold them; the entry-array note above covers the retired-list double-free measured on rmmod. */
-		WRITE_ONCE(e->dead, true);
-		smp_wmb();
+		/* Rewriting a rule: take the old slot back (grace period included), which is also what makes
+		 * the new entry possible even with every slot in use.  The live count does not change (one
+		 * rule out, one in below), so it is only touched in the branch that adds a rule. */
+		or_reclaim_slot(e);
 		e = NULL;
+	} else {
+		/* A new rule: make it visible to the name-layer hook before the slot itself is filled.  That is the safe
+		 * direction - the hook then resolves one name it would not have had to resolve, instead of missing a rule. */
+		WRITE_ONCE(susfs_open_redirect_rules, READ_ONCE(susfs_open_redirect_rules) + 1);
 	}
 
-	e = &or_entries[nor++];
-	/* Take the slot, then mark it "not published" before a single field lands in it.  The
-	 * array is static, so a never-used slot already has dead == false - which means the
-	 * WRITE_ONCE(e->dead, false) below is a no-op for a fresh slot and the "cleared LAST, so
-	 * false means the rest of the entry is complete" invariant never held: nor++ publishes
-	 * the slot while target_ino/target_dev are still zero, and those two fields are written
-	 * BEFORE the two struct path fields.  A lockless reader (or_find_by_inode() and friends,
-	 * called from the kprobes) could therefore match a real (ino, dev) and hand
-	 * &e->redirected_path - still { NULL, NULL } - to vfs_open(), or &e->target_path to
-	 * d_path()/vfs_statfs().  vfs_open() does d_backing_inode(path->dentry) immediately, so
-	 * that is a NULL dereference in the kernel.  uid_scheme is also still 0 there, which is
-	 * UID_NON_APP_PROC, so even root's own open of the target passes the gate. */
-	WRITE_ONCE(e->dead, true);
-	smp_wmb();		/* the flag must be visible before the fields it guards */
+	/* A reclaimed slot first, a never-used one otherwise.  Both are already out of service (dead is
+	 * raised for every slot in susfs_open_redirect_init() and stays raised while a slot is on the
+	 * free list), so growing the bound cannot publish a half-written entry: a lockless reader that
+	 * sees the new `nor` finds dead == true and skips the slot.  Ordering the flag against the bound
+	 * was tried and is not enough on arm64, which may reorder the reader's load of `nor` against its
+	 * load of `dead` - raising the flag up front is what removes the window instead of narrowing
+	 * it. */
+	if (or_free_n) {
+		e = &or_entries[or_free[--or_free_n]];
+	} else {
+		e = &or_entries[nor++];
+	}
+
+	/* Then fill it in, and publish by clearing the flag last.  Every field is written before that
+	 * store, the snapshot and both pathnames included - so a reader that passed its own `dead` check
+	 * sees a complete rule. */
 	strscpy(e->target_pathname, target, OR_PATH_MAX);
 	strscpy(e->redirected_pathname, redirected, OR_PATH_MAX);
 	e->target_ino = ti->i_ino;
 	e->target_dev = ti->i_sb->s_dev;
+	e->target_igen = ti->i_generation;
 	e->target_mnt_id = (unsigned long)real_mount(tp.mnt)->mnt_id;
 	e->redirected_ino = ri->i_ino;
 	e->redirected_dev = ri->i_sb->s_dev;
-	e->redirected_path = rp;   /* transfer the cached references */
-	e->target_path = tp;
+	e->redirected_igen = ri->i_generation;
+	e->spoofed_kstatfs = spoofed_kstatfs;
 	e->uid_scheme = scheme;
 	smp_wmb();
 	WRITE_ONCE(e->dead, false);	/* publish last: readers key off this */
 
-	return 0;			/* both path references now belong to e */
+	/* Both parsed paths are dropped right here: the entry keeps the numbers and the snapshot, and
+	 * the names as strings, so the rule holds nothing that a filesystem teardown would wait for. */
+	path_put(&rp);
+	path_put(&tp);
+	return 0;
+}
+
+/* The second half of a reclaim, without the wait: clear a slot that nobody can be looking at any more
+ * and put it back on the free list.  Split out so or_clear_all() can pay for one grace period for all
+ * the rules it drops instead of one each.
+ *
+ * The caller MUST have raised `dead` and waited a grace period before calling this: the flag is what
+ * stops a NEW reader from matching the slot, and the wait is what covers the readers that got past it
+ * (they copy what they need out of the entry while they hold rcu_read_lock).  The assertion below
+ * states that requirement instead of raising the flag here, because raising it here would silently
+ * accept a caller that skipped the wait. */
+static void or_release_slot(struct sus_or_entry *e)
+{
+	WARN_ON_ONCE(!READ_ONCE(e->dead));
+
+	e->target_pathname[0] = '\0';
+	e->redirected_pathname[0] = '\0';
+	e->target_ino = 0;
+	e->target_dev = 0;
+	e->target_igen = 0;
+	e->target_mnt_id = 0;
+	e->redirected_ino = 0;
+	e->redirected_dev = 0;
+	e->redirected_igen = 0;
+	memset(&e->spoofed_kstatfs, 0, sizeof(e->spoofed_kstatfs));
+	e->uid_scheme = 0;
+	smp_wmb();
+	/* Cannot overflow while the accounting is right: only a live slot is pushed, and a live slot is
+	 * off the list until it is handed out again.  The check is here so a future path that frees the
+	 * same slot twice says so instead of writing past the array - or_free_n sits right after it. */
+	WARN_ON_ONCE(or_free_n >= SUS_OR_MAX);
+	if (or_free_n < SUS_OR_MAX)
+		or_free[or_free_n++] = (unsigned int)(e - or_entries);
+}
+
+/* Retire one slot: raise the flag, wait a grace period, then clear and free it.  The wait is the whole
+ * point - every reader copies what it needs out of an entry inside its own rcu_read_lock (the
+ * name-layer hook copies the target name, the d_path face copies it into the probe's per-instance
+ * data, the statfs face copies the snapshot, the maps and fdinfo faces rewrite the formatted line
+ * before they leave), so once synchronize_rcu() returns nobody can still be looking at these fields.
+ *
+ * Called with or_lock held, i.e. from process context: it sleeps, and that is fine because the only
+ * callers are the rule-management paths (a /proc write or the supercall).  Nothing else may hold a
+ * pointer into the table across a sleep. */
+static void or_reclaim_slot(struct sus_or_entry *e)
+{
+	WRITE_ONCE(e->dead, true);
+	smp_wmb();
+	synchronize_rcu();
+	or_release_slot(e);
+}
+
+/* Drop every rule at once - the "clear" command.  One grace period covers all of them: the slots are
+ * marked dead first, so a reader inside its rcu section has either already copied what it needs or
+ * skips them, and after synchronize_rcu() the fields can be cleared and the slots handed out again.
+ * Called with or_lock held (it sleeps), like or_reclaim_slot() - and unlike a loop over or_del() it
+ * waits once, not once per rule, and never hands a callee the inside of a table it is clearing. */
+static void or_clear_all(void)
+{
+	unsigned long marked = 0;
+	int i;
+
+	BUILD_BUG_ON(SUS_OR_MAX > BITS_PER_LONG);
+
+	for (i = 0; i < nor; i++) {
+		if (READ_ONCE(or_entries[i].dead))
+			continue;
+		WRITE_ONCE(or_entries[i].dead, true);
+		marked |= 1UL << i;
+	}
+
+	/* The live count drops before the wait, not after: the name-layer hook reads it on every open, and
+	 * every rule is already dead at this point - a lookup during the grace period would only resolve a
+	 * name to find nothing. */
+	WRITE_ONCE(susfs_open_redirect_rules, 0);
+
+	if (marked) {
+		smp_wmb();
+		synchronize_rcu();
+		for (i = 0; i < nor; i++) {
+			if (marked & (1UL << i))
+				or_release_slot(&or_entries[i]);
+		}
+	}
 }
 
 /* Only the rules whose target path matches are dropped; the reverse entry is not
@@ -1017,18 +1350,17 @@ static void or_del(const char *target)
 	struct sus_or_entry *e;
 
 	e = or_find_by_path(target);
-	if (!e)
+	if (!e || READ_ONCE(e->dead))
 		return;
 
-	/* Dead, and that is all.  A reader that has already passed its `dead` check still holds a pointer to these fields and
-	 * hands them to vfs_open()/d_path()/vfs_statfs(), which dereference path->dentry at once (fs/open.c:1033,
-	 * fs/d_path.c:282, fs/statfs.c:90) - clearing them is a NULL-dereference oops any app can reach, since the control
-	 * node is 0777 (or_uid_matches() is consulted later, in the probe).  So they stay, pinned until unload. */
-	WRITE_ONCE(e->dead, true);
-	smp_wmb();
+	/* The slot goes back to the free list after a grace period, so the fields may be cleared and the
+	 * slot handed out again - the pointers this used to leave behind are gone (see or_reclaim_slot()),
+	 * and a name that a reader is still looking at is safe because every reader copies it out under
+	 * rcu_read_lock. */
+	or_reclaim_slot(e);
 
-	e->target_pathname[0] = '\0';
-	e->redirected_pathname[0] = '\0';
+	if (READ_ONCE(susfs_open_redirect_rules))
+		WRITE_ONCE(susfs_open_redirect_rules, READ_ONCE(susfs_open_redirect_rules) - 1);
 }
 
 /* Slots are never compacted (that array move was itself part of the race).  The kprobes stay registered for the whole
@@ -1044,7 +1376,7 @@ static ssize_t or_proc_write(struct file *file, const char __user *buf,
 	long scheme;
 
 	/* Same gate as or_proc_open(): an fd opened before the opener dropped privileges must not become a way in. */
-	if (current_uid().val != 0)
+	if (!susfs_control_visible())
 		return -ENOENT;
 
 	if (len >= sizeof(cmd))
@@ -1069,13 +1401,11 @@ static ssize_t or_proc_write(struct file *file, const char __user *buf,
 		or_del(argv[1]);
 		err = 0;
 	} else if (!strcmp(argv[0], "clear")) {
-		int i;
-
-		for (i = 0; i < nor; i++) {
-			if (READ_ONCE(or_entries[i].dead))
-				continue;
-			or_del(or_entries[i].target_pathname);
-		}
+		/* All rules at once: mark every live slot dead, wait ONE grace period for the readers, then
+		 * clear them and put them on the free list.  Going through or_del() per rule would wait a
+		 * grace period per rule with the rule lock held, and it would hand the inside of the table to
+		 * a callee that clears the very slot it was given. */
+		or_clear_all();
 		err = 0;
 	}
 

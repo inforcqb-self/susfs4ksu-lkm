@@ -136,6 +136,40 @@ static int ksu_exact_name_cb(void *data, const char *name, struct module *mod, u
     return 1;	/* stop the walk */
 }
 
+/* Same shape as ksu_exact_name_cb(), but it keeps every match (see ksu_find_symbol_all()). */
+struct ksu_all_names_ctx {
+    const char *symbol_name;
+    unsigned long *addrs;
+    int max;
+    int n;
+};
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+static int ksu_all_names_cb(void *data, const char *name, unsigned long addr)
+#else
+static int ksu_all_names_cb(void *data, const char *name, struct module *mod, unsigned long addr)
+#endif
+{
+    struct ksu_all_names_ctx *ctx = data;
+    int i;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+    if (mod)
+        return 0;
+#endif
+
+    if (!name || !addr || strcmp(name, ctx->symbol_name) != 0)
+        return 0;
+
+    for (i = 0; i < ctx->n; i++)
+        if (ctx->addrs[i] == addr)
+            return 0;			/* the walk can report a symbol twice (aliases) */
+
+    if (ctx->n < ctx->max)
+        ctx->addrs[ctx->n++] = addr;
+    return 0;				/* keep walking: uniqueness is not assumed */
+}
+
 unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
 {
     unsigned long addr = 0;
@@ -195,40 +229,6 @@ unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
      * be verified. */
     pr_warn("ignore symbol %s: its owner cannot be checked on this kernel\n", symbol_name);
     return 0;
-}
-
-/* Same shape as ksu_exact_name_cb(), but it keeps every match (see ksu_find_symbol_all()). */
-struct ksu_all_names_ctx {
-    const char *symbol_name;
-    unsigned long *addrs;
-    int max;
-    int n;
-};
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-static int ksu_all_names_cb(void *data, const char *name, unsigned long addr)
-#else
-static int ksu_all_names_cb(void *data, const char *name, struct module *mod, unsigned long addr)
-#endif
-{
-    struct ksu_all_names_ctx *ctx = data;
-    int i;
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
-    if (mod)
-        return 0;
-#endif
-
-    if (!name || !addr || strcmp(name, ctx->symbol_name) != 0)
-        return 0;
-
-    for (i = 0; i < ctx->n; i++)
-        if (ctx->addrs[i] == addr)
-            return 0;			/* the walk can report a symbol twice (aliases) */
-
-    if (ctx->n < ctx->max)
-        ctx->addrs[ctx->n++] = addr;
-    return 0;				/* keep walking: uniqueness is not assumed */
 }
 
 /* Raw name lookup through the bootstrapped kallsyms_lookup_name(), for names the KERNEL does not
@@ -373,6 +373,114 @@ void *ksu_resolve_symbol_for_functable_hook(const char *symbol_name)
 
     return resolve_symbol_variant(symbol_name, symbol_len);
 #endif
+}
+
+/* Is @addr one of the addresses kallsyms has for @name?
+ *
+ * Asking the question address -> name (ksu_symbol_is_start() below) cannot answer this on its own,
+ * and the failure is not hypothetical: when two functions end up at the same address (identical
+ * code folded together, or a vendor alias), kallsyms_lookup() names that address after whichever
+ * symbol it lists first, which can be the OTHER one.  Measured on a 6.12.23 vendor kernel: the
+ * address SELinux registered for inode_getattr resolves to `selinux_current_getsecid_subj`, which
+ * sits at that very address - see ksu_lsm_addr_is_named() in lsm_hook.c, the same test for the
+ * >= 6.12 LSM slot scan.
+ *
+ * So the question is asked the other way round: does ANY address named @name equal this pointer?
+ * Note that the comparison is against the spelling the WALKER reports, i.e. the raw one:
+ * kallsyms_lookup() cleans what it returns (CONFIG_LTO_CLANG strips ".llvm.<hash>", and the
+ * 5.10/5.15 spelling strips everything from the last '$'), while kallsyms_on_each_symbol() hands its
+ * callback the expanded name untouched.  The two tests therefore cover each other's blind spot -
+ * ksu_symbol_is_start() asks both.
+ *
+ * Module-owned symbols are not considered (ksu_find_symbol_all() drops them, like
+ * find_kernel_symbol_exact()), and 0 is returned when nothing is known about @addr.  __nocfi because
+ * the walker is reached through a function pointer. */
+int __nocfi ksu_addr_is_named(unsigned long addr, const char *name)
+{
+    unsigned long addrs[8];
+    int n, i;
+
+    if (!addr || !name || !name[0])
+        return 0;
+
+    n = ksu_find_symbol_all(name, addrs, (int)ARRAY_SIZE(addrs));
+    /* A full list means the walker may have had more: report it, so a caller that ends up on the
+     * fallback path can tell "the name is not known" apart from "the list did not fit".  The
+     * direction is still safe - a missed match reads as "not proven", never as "proven". */
+    if (n >= (int)ARRAY_SIZE(addrs))
+        pr_warn("ksu_addr_is_named: '%s' has at least %d addresses - list truncated, a match may have been missed\n",
+                name, n);
+    for (i = 0; i < n; i++) {
+        if (addrs[i] == addr)
+            return 1;
+    }
+
+    return 0;
+}
+
+/* Is @addr the FIRST instruction of a core-kernel function called @name - i.e. is it safe to hang a
+ * kprobe on it as that function?  Two tests, because neither is complete on its own:
+ *
+ *   - address -> name through the bootstrapped kallsyms_lookup(): it returns the name of the symbol
+ *     CONTAINING @addr and, when asked for it, the offset of @addr inside that symbol.  A non-NULL
+ *     answer with modname == NULL and offset == 0 means "core-kernel symbol, and @addr is its first
+ *     instruction".  The name comes back CLEANED, so a suffix the kernel strips still matches
+ *     @name; the suffixes it does not strip are accepted through the whitelist below ('.' for
+ *     .constprop/.isra/.cold/.part, '$' for the older spelling).  A .cfi_jt name is refused: that
+ *     symbol is a CFI jump-table ENTRY (a `bti c ; b <body>` stub), not the body a kprobe has to
+ *     hang on.
+ *   - ksu_addr_is_named(), which covers the kernel that names @addr after a different symbol, and
+ *     which does not need kallsyms_lookup() to have bootstrapped (it has its own walker fallback).
+ *
+ * Non-zero means "proven to be that function's start"; 0 means "not proven", and every caller treats
+ * that as "do not probe".  A @name that cannot fit in the name buffer is refused rather than
+ * compared against it. */
+int __nocfi ksu_symbol_is_start(unsigned long addr, const char *name)
+{
+    char buf[KSYM_SYMBOL_LEN];
+    char *modname = NULL;
+    unsigned long offset = 0;
+    size_t len;
+
+    if (!addr || !name || !name[0])
+        return 0;
+
+    len = strlen(name);
+    if (kallsyms_lookup_fn && len < sizeof(buf) &&
+        kallsyms_lookup_fn(addr, NULL, &offset, &modname, buf) && !modname && !offset &&
+        !strncmp(buf, name, len) && (!buf[len] || buf[len] == '.' || buf[len] == '$') &&
+        !strstr(buf + len, ".cfi_jt"))
+        return 1;
+
+    /* Not proven by name: ask it the other way round (see ksu_addr_is_named()). */
+    return ksu_addr_is_named(addr, name);
+}
+
+/* __nocfi like every other function here that reaches a resolved symbol: the call to
+ * kallsyms_lookup() goes through a function pointer, so an instrumented call site would be
+ * checked against the kernel's type id - and that check panics when it does not match.
+ * 6.12/6.18 reach this through the static-call takeover (lsm_hook.c), i.e. it is on a real
+ * path, not a debug one; tools/cfi_sites.py now fails the build if it is ever un-annotated
+ * again. */
+int __nocfi ksu_symbol_name_of(unsigned long addr, char *buf, char **module_out)
+{
+    char *modname = NULL;
+
+    if (module_out)
+        *module_out = NULL;
+    if (!buf)
+        return -EINVAL;
+    buf[0] = '\0';
+    if (!kallsyms_lookup_fn)
+        return -ENOSYS;
+    if (!addr)
+        return -EINVAL;
+    if (!kallsyms_lookup_fn(addr, NULL, NULL, &modname, buf))
+        return -ENOENT;
+    if (module_out)
+        *module_out = modname;
+
+    return (int)strlen(buf);
 }
 
 void __init ksu_init_symbol_resolver(void)

@@ -107,6 +107,13 @@ static bool sus_map_gate_ok(void)
     return susfs_is_current_proc_umounted_app();
 }
 
+/* Lines dropped by the show_map / show_map_vma / show_smap probes: this is the decision.
+ * Kept apart from hide_modules and from n_walk_skip, which is the walk layer that only feeds
+ * it - a vendor kernel can have every walk counter moving and this one at zero, which is
+ * exactly the fingerprint of an inlined show_map_vma (susfs4ksu-lkm#102).  Declared here
+ * because sus_map_skip_vma_pre() below is its first user. */
+static atomic_t n_show_hides = ATOMIC_INIT(0);
+
 /* One handler for show_map_vma (maps) and show_smap (smaps) - both are seq_operations
  * .show callbacks that emit only what they are given, so returning 0 means "handled,
  * nothing printed" (seq_read ignores the value), which is upstream's SUS_MAP effect.
@@ -142,6 +149,7 @@ static int sus_map_skip_vma_pre(struct kprobe *kp, struct pt_regs *regs)
     if (!inode)
         return 0;
     if (sus_map_lookup(inode->i_ino, inode->i_sb->s_dev)) {
+        atomic_inc(&n_show_hides);
         /* ratelimited like sus_path's; the rule stores no path, so ino/dev name it */
         pr_info_ratelimited("sus_map: hid %s line (ino=%lu dev=%lu uid=%u)\n",
                             kp->symbol_name, inode->i_ino,
@@ -161,6 +169,21 @@ static struct kprobe kp_map = {
 
 static struct kprobe kp_map_smap = {
     .symbol_name = "show_smap",
+    .pre_handler = sus_map_skip_vma_pre,
+};
+
+/* The outer half of the maps listing.  show_map() is what proc_pid_maps_op points at
+ * (a proc_ops .proc_show field, i.e. a function pointer in data, which a build cannot
+ * inline away), and it calls show_map_vma() for every line.  A vendor kernel is free to
+ * inline that call - measured on a vivo 6.6.89: `show_map_vma` exists in /proc/kallsyms
+ * and the probe arms, but it never fires, so map_stat shows hides=0 while the listing
+ * stays visible (susfs4ksu-lkm#102).  Probing show_map() instead catches the same vma at
+ * the outer layer; and because a hit there returns straight to the caller, the inner
+ * probe (where it is out of line) never sees the same vma twice.  Both take
+ * (struct seq_file *, void *v) with the vma as the second argument, so one handler serves
+ * all of them. */
+static struct kprobe kp_map_outer = {
+    .symbol_name = "show_map",
     .pre_handler = sus_map_skip_vma_pre,
 };
 
@@ -202,6 +225,10 @@ static atomic_t n_walk_dbg_left = ATOMIC_INIT(4);
 /* map_files symlink resolutions that were turned into ENOENT.  n_getlink_calls vs
  * n_getlink_skip keeps "the probe ran" apart from "the probe matched". */
 static atomic_t n_map_files_hides = ATOMIC_INIT(0);
+/* The reference map_files_get_link() took for its caller could not be handed to task_work
+ * (GFP_ATOMIC or task_work_add): the call is then left as the kernel answered it - visible, but
+ * not leaked - and this is the only thing that says so. */
+static atomic_t n_map_files_putfail = ATOMIC_INIT(0);
 static atomic_t n_getlink_calls = ATOMIC_INIT(0);
 static atomic_t n_getlink_skip = ATOMIC_INIT(0);
 static atomic_t n_getlink_nomatch = ATOMIC_INIT(0);
@@ -525,6 +552,42 @@ static int sus_map_vm_access_pre(struct kprobe *kp, struct pt_regs *regs)
  * `ei->op.proc_get_link` = map_files_get_link(), the one place that hands over the MAPPED
  * file's path.  So the hook judges by inode (path->dentry), which is exact and only ever
  * fails a call that would have succeeded: the caller treats a negative return as "no link". */
+/* Releasing the reference map_files_get_link() took, from task_work rather than from the probe.
+ *
+ * The probe's return handler runs in the exception context that fired it (arm64 raises BRK for a
+ * kprobe), where sleeping is not allowed - and path_put() can sleep, because dropping the last
+ * reference reaches ->d_iput().  GFP_ATOMIC and task_work_add() are both safe there; what is not
+ * safe is guessing, so a failure to queue is reported and the reference is left where it was. */
+struct sus_map_put_work {
+	struct callback_head cb;
+	struct path path;
+};
+
+static void sus_map_put_work_fn(struct callback_head *cb)
+{
+	struct sus_map_put_work *w = container_of(cb, struct sus_map_put_work, cb);
+
+	path_put(&w->path);
+	kfree(w);
+}
+
+/* 0 when the release has been queued, -errno when it has not. */
+static int sus_map_path_put_soon(const struct path *p)
+{
+	struct sus_map_put_work *w;
+
+	w = kmalloc(sizeof(*w), GFP_ATOMIC);
+	if (!w)
+		return -ENOMEM;
+	w->path = *p;
+	init_task_work(&w->cb, sus_map_put_work_fn);
+	if (task_work_add(current, &w->cb, TWA_RESUME)) {
+		kfree(w);
+		return -EIO;
+	}
+	return 0;
+}
+
 static int sus_map_maplink_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     /* struct path *path is an output argument, filled only at return: save it here. */
@@ -563,6 +626,21 @@ static int sus_map_maplink_ret(struct kretprobe_instance *ri, struct pt_regs *re
     }
 
     atomic_inc(&n_map_files_hides);
+    /* The reference has to change hands with the answer.  map_files_get_link() runs
+     * `*path = vma->vm_file->f_path; path_get(path);` before it returns 0, and its only caller
+     * releases that reference on the SUCCESS path alone (proc_pid_readlink():
+     * `if (error) goto out; ... path_put(&path);`).  Turning the return into -ENOENT without
+     * taking the reference over leaked a dentry and a mount reference on every resolution of a
+     * hidden mapping's symlink - the mapped file keeps its own reference, so the dentry is never
+     * reclaimed and the mount can never be unmounted, and an app uid can do it in a loop.
+     *
+     * It cannot be released here (see sus_map_path_put_soon()), so it goes to task_work.  If even
+     * that fails the call keeps the kernel's own answer: a symlink that resolves is a tell, a
+     * silent leak is not. */
+    if (sus_map_path_put_soon(p)) {
+        atomic_inc(&n_map_files_putfail);
+        return 0;
+    }
     pr_info_ratelimited("sus_map: hid map_files symlink to ino=%lu (uid=%u)\n",
                         inode->i_ino, current_uid().val);
     regs_set_return_value(regs, (unsigned long)(long)-ENOENT);
@@ -580,7 +658,7 @@ static bool kr_map_files_ok;
 
 /* Kept in one table so init and exit cannot drift apart. */
 static struct kprobe *const map_probes[] = {
-    &kp_map, &kp_map_smap, &kp_map_walk, &kp_map_walk_vma,
+    &kp_map, &kp_map_smap, &kp_map_outer, &kp_map_walk, &kp_map_walk_vma,
     &kp_gup_remote, &kp_gup_remote_inner,
 };
 #define N_MAP_PROBES ARRAY_SIZE(map_probes)
@@ -601,7 +679,7 @@ static int sus_map_stat_show(char *buf, const struct kernel_param *kp)
 
     return scnprintf(buf, PAGE_SIZE,
                      "rules=%d armed=%d/%d walk_seen=%d walk_vma=%d walk_skipped=%d "
-                     "ops_hit=%d scan_fail=%d nofile=%d nomatch=%d getlink: calls=%d skip=%d nomatch=%d hides=%d\n"
+                     "ops_hit=%d scan_fail=%d nofile=%d nomatch=%d getlink: calls=%d skip=%d nomatch=%d hides=%d putfail=%d line_hides=%d\n"
                      "vm: gup_calls=%d inner_calls=%d hides=%d\n"
                      "ops: smaps=%px smaps_shmem=%px pagemap=%px\n",
                      nmap, armed, (int)N_MAP_PROBES,
@@ -611,6 +689,7 @@ static int sus_map_stat_show(char *buf, const struct kernel_param *kp)
                      atomic_read(&n_walk_nofile), atomic_read(&n_walk_nomatch),
                      atomic_read(&n_getlink_calls), atomic_read(&n_getlink_skip),
                      atomic_read(&n_getlink_nomatch), atomic_read(&n_map_files_hides),
+                     atomic_read(&n_map_files_putfail), atomic_read(&n_show_hides),
                      atomic_read(&n_gup_calls), atomic_read(&n_gup_inner_calls),
                      atomic_read(&n_vm_hides),
                      sus_map_ops_smaps, sus_map_ops_smaps_shmem,
@@ -714,6 +793,12 @@ void susfs_sus_map_exit(void)
 {
     int i;
 
+    /* Same lock as the registration side.  The arm path is check-then-act on map_probe_armed[],
+     * so disarming without it would break the invariant the duplicate-registration fix
+     * established: one probe's arm and disarm belong under the same lock.  (No /proc write
+     * reaches the arm path today - it runs from init and the supercall, and the supercall's
+     * task_work holds a module reference - so this is symmetry rather than a live window.) */
+    mutex_lock(&map_ctl_lock);
     for (i = 0; i < (int)N_MAP_PROBES; i++) {
         if (!map_probe_armed[i])
             continue;
@@ -727,7 +812,13 @@ void susfs_sus_map_exit(void)
         kr_map_files_ok = false;
     }
     map_registered = false;
-    nmap = 0;
+    mutex_unlock(&map_ctl_lock);
+
+    /* Published the way sus_map_add_full() does it (smp_store_release against the
+     * smp_load_acquire readers); a plain store would break that protocol.  No reader can be live
+     * by now - every probe is unregistered above - but the write should still have the right
+     * shape. */
+    smp_store_release(&nmap, 0);
 }
 
 /* supercall: CMD_SUSFS_ADD_SUS_MAP (resolve path -> ino/dev, register hook) */

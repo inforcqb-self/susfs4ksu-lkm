@@ -13,6 +13,7 @@
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
+#include "ksu_allow_gate.h"	/* the control-node gate is su's own */
 
 static bool log_enabled = true;
 
@@ -39,7 +40,7 @@ static int log_proc_open(struct inode *inode, struct file *file)
 	/* 0777 on purpose: the ENOENT contract for non-root callers comes from sus_path's hidden set, and a
 	 * restrictive mode would answer EACCES - which leaks that the node exists.  That makes sus_path's hook the
 	 * only thing between an app and this interface, so the handler refuses non-root callers itself as well. */
-	if (current_uid().val != 0)
+	if (!susfs_control_visible())
 		return -ENOENT;
 	return single_open(file, log_proc_show, NULL);
 }
@@ -51,7 +52,7 @@ static ssize_t log_proc_write(struct file *file, const char __user *buf,
 
 	/* Same reason as the open check: an fd opened before the process dropped privileges must not become a
 	 * way in. */
-	if (current_uid().val != 0)
+	if (!susfs_control_visible())
 		return -ENOENT;
 
 	if (copy_from_user(&c, buf, 1))

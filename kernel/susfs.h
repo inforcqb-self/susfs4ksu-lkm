@@ -42,20 +42,6 @@ int susfs_imports_crosscheck(void);
 /* Add a path to sus_path's hidden set from kernel code (no supercall needed); returns 0 or negative errno. */
 int sus_path_add_hidden(const char *path);
 
-/* The listing filter, driven from the shared sys_exit tracepoint in susfs_kstat.c: which layout a
- * syscall number denotes for a task running the given ABI (-1 when it is not a listing call), the
- * rewrite itself, and whether it is armed at all (it is armed on the first rule, and not at all
- * with no_extra).  Split in three so the caller can answer all of that before it touches the
- * arguments.  The stat family in susfs_kstat.c has its own is_compat_task() gate of the same
- * shape; it does not call these. */
-bool sus_path_dirent_armed(void);
-int sus_path_dirent_layout_id(long syscall_nr, bool compat);
-long sus_path_dirent_filter(int lay_id, unsigned long buf, long ret);
-
-/* Whether the shared sys_exit tracepoint (registered by the stat family) is up.  sus_path's
- * listing filter rides it but does not own it, so it needs the answer for its own report. */
-bool susfs_kstat_tracepoint_armed(void);
-
 /* Same, for one of this module's own control nodes: flagged so the gate hides it from EVERY non-root caller, not merely
  * from app processes - otherwise a probe running as system (1000) or shell (2000) reads the node name out of /proc. */
 int sus_path_add_self_hidden(const char *path);
@@ -63,6 +49,35 @@ int sus_path_add_self_hidden(const char *path);
 /* Undo sus_path_add_self_hidden(): drops the rule for @path and restores whatever it changed (the relaxed mode, the inode
  * reference); returns the number of rules removed, so 0 means "was not registered".  Process context only (iput). */
 int sus_path_del_path(const char *path);
+
+/* The two AArch32 listing numbers, and they live here rather than in sus_path.c because the
+ * sys_call_table entries that drive the filter (susfs_kstat.c) have to name them as well: a
+ * second copy of "141" in another file is a number nobody would notice drifting.  Native
+ * getdents64 is 61 in the native table; AArch32 numbers it 217, and 141 is AArch32's own
+ * getdents - which is why the number alone never identifies the call and the ABI is always
+ * read with it. */
+#define SUS_NR_GETDENTS64_COMPAT 217
+#define SUS_NR_GETDENTS_COMPAT   141
+
+/* The listing filter: which layout a syscall number denotes for a task running the given ABI
+ * (-1 when it is not a listing call), and the rewrite itself.  There is no "armed" flag any
+ * more: the filter self-gates on no_extra, on the syscall's own return value and on whether any
+ * rule exists, so what the caller has to get right is the arguments, not the state.  The stat
+ * family in susfs_kstat.c has its own gate of the same shape; it does not call these. */
+int sus_path_dirent_layout_id(long syscall_nr, bool compat);
+
+long sus_path_dirent_filter(int lay_id, unsigned long buf, long ret);
+/* Pre-emission dirent filter (sus_dirent.c): a hidden name is never written to the caller. */
+bool sus_path_dirent_hidden(u64 ino, const char *name);
+__nocfi bool susfs_dirent_prefilter(const struct pt_regs *regs, long *out,
+					bool compat);
+int susfs_sus_dirent_init(void);
+void susfs_sus_dirent_exit(void);
+
+/* One line of per-ABI dirent counters for /proc/susfs_kstat: "the callback ran and filtered
+ * nothing" has to be distinguishable from "the callback never ran", and the same line names the
+ * ABI each count belongs to.  Returns the length written, 0 when the buffer is too small. */
+int sus_path_dirent_stat_line(char *buf, size_t size);
 
 /* The module's own name: the /sys/module directory and the modinfo name are both the module file name, and the self-hide
  * rules and the /proc/modules filter have to agree with it. */
@@ -141,6 +156,24 @@ void susfs_hide_syms_exit(void);
 bool susfs_hide_syms_active(void);
 bool sus_path_lsm_active(void);
 
+/* The O_PATH layer's own state, for the name layer that borrows its five open entries: true only when
+ * at least one of those entries really carries its wrapper (opath_dump=1 and opath_test=N both leave
+ * entries unwrapped while reporting success - see susfs_opath.c). */
+bool susfs_opath_armed(void);
+
+/* The same layer's post-check, called by open_redirect's name layer with the fd it produced itself, so
+ * an O_PATH answer is judged by one implementation whichever of the two produced it.  A negative
+ * argument (an errno) passes straight through. */
+long susfs_opath_post_fd(long ret);
+
+/* sus_path's hidden decision, for the layers that hold the inode the kernel resolved rather than a path they would have to
+ * resolve themselves (susfs_opath.c post-checks the file an open(..., O_PATH) produced).  Same question the LSM hooks ask,
+ * same answer: identity first, then (dev, i_ino), never a path string.  Not a new judgement - it is the static
+ * sus_path_inode_hidden() with a name other translation units can call, so O_PATH and the ordinary open path cannot drift
+ * apart.  NULL inode means "not hidden" (a negative dentry). */
+struct inode;
+bool sus_path_inode_hidden_public(struct inode *inode);
+
 /* Whether a 0777 /proc/susfs_* control node may be created.  Two independent conditions, neither optional: susfs_expose_proc
  * (the operator opted in) and sus_path_lsm_active() (with 0777 DAC passes every caller, so only the LSM layer can still
  * answer ENOENT for an app).  This gates node CREATION ONLY, never hook registration: an earlier revision returned early from
@@ -154,5 +187,33 @@ static inline bool susfs_control_node_allowed(void)
  * this is a lookup by ino alone and returns false when the number is ambiguous (two rules, same redirected ino) or the caller is
  * not one the reverse disguise applies to.  On success *out_ino is the target inode to show, *out_mnt_id the target mount id. */
 bool susfs_open_redirect_spoof_ids(unsigned long ino, unsigned long *out_ino, unsigned long *out_mnt_id);
+
+/* The width of a rule's stored pathnames (the ABI fields are char[256], and matching that width stops
+ * a legal long path from being truncated into a rule for a different path). */
+#define SUSFS_OR_PATH_MAX 256
+
+/* Asked by the name-layer entry hook (susfs_or_entry.c) for the path a caller is about to open.
+ * The redirect target is COPIED into the caller's buffer (buflen >= SUSFS_OR_PATH_MAX) while the
+ * lookup runs under rcu_read_lock, and the return value is false when no live rule matches (or the
+ * name does not fit).  A pointer into the rule could not be handed out any more: rule slots are
+ * recycled now (a deleted rule's slot is handed out again once a grace period has passed), so
+ * nothing inside an entry may be read after the lookup returns. */
+bool susfs_open_redirect_match_path(const struct path *path, char *buf, size_t buflen);
+
+/* How many rules are live right now.  The name-layer hook runs for every open() on the system, so it
+ * tests this before it resolves anything - a table with no live rule costs one load instead of a path
+ * lookup, and deleting the last rule takes that cost away again.  Written under the rule lock. */
+extern unsigned int susfs_open_redirect_rules;
+
+static inline bool susfs_open_redirect_active(void)
+{
+	return READ_ONCE(susfs_open_redirect_rules) != 0;
+}
+
+/* The name-layer redirection of the same feature: no cached path, no inode held.  Optional - it
+ * stays unarmed when a symbol it needs is missing, and such a layer makes open_redirect refuse
+ * rules - and on by default (the or_entry parameter can turn it off). */
+int susfs_or_entry_init(void);
+void susfs_or_entry_exit(void);
 
 #endif

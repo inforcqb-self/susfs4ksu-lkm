@@ -20,6 +20,7 @@
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
 #include "susfs_kprobe.h"
+#include "ksu_allow_gate.h"	/* the control-node gate is su's own */
 
 /* module_param overrides for the two domains: the default su domain is the SukiSU variant ("ksu"), stock
  * KernelSU uses "su".  The sid is resolved at init time via security_secctx_to_secid(). */
@@ -112,7 +113,10 @@ static int avc_register(void)
 	return 0;
 }
 
-static void avc_unregister(void)
+/* Caller must hold avc_ctl_lock.  Kept separate from avc_unregister() because the exit path has to
+ * do the disarm and "refuse further registration" in ONE critical section - something the /proc
+ * write path (which also disarms, but must stay re-enablable) must not do. */
+static void avc_unregister_locked(void)
 {
 	mutex_lock(&avc_ctl_lock);
 	if (!avc_registered) {
@@ -129,6 +133,13 @@ static void avc_unregister(void)
 	SUSFS_LOGI("susfs_avc_spoof: hook removed\n");
 }
 
+static void avc_unregister(void)
+{
+	mutex_lock(&avc_ctl_lock);
+	avc_unregister_locked();
+	mutex_unlock(&avc_ctl_lock);
+}
+
 static int avc_proc_show(struct seq_file *m, void *v)
 {
 	seq_printf(m, "%d (su_sid=%u priv_app_sid=%u enter=%d hits=%d)\n",
@@ -141,7 +152,7 @@ static int avc_proc_open(struct inode *inode, struct file *file)
 {
 	/* 0777 is deliberate (the ENOENT contract comes from sus_path's hidden set, not from the mode), so
 	 * refuse non-root callers here too - see the note in susfs_enable_log.c's log_proc_open(). */
-	if (current_uid().val != 0)
+	if (!susfs_control_visible())
 		return -ENOENT;
 	return single_open(file, avc_proc_show, NULL);
 }
@@ -152,7 +163,7 @@ static ssize_t avc_proc_write(struct file *file, const char __user *buf,
 	char c;
 	int rc = 0;
 
-	if (current_uid().val != 0)
+	if (!susfs_control_visible())
 		return -ENOENT;
 
 	if (copy_from_user(&c, buf, 1))
@@ -229,7 +240,13 @@ int susfs_avc_spoof_init(void)
 
 void susfs_avc_spoof_exit(void)
 {
-	avc_unregister();
+	/* One critical section for "no more registrations" and the disarm: a /proc write holds no
+	 * module reference and can be inside avc_proc_write() right now. */
+	mutex_lock(&avc_ctl_lock);
+	avc_exiting = true;
+	avc_unregister_locked();
+	mutex_unlock(&avc_ctl_lock);
+
 	avc_spoof_enabled = false;
 	if (avc_proc_entry) {
 		proc_remove(avc_proc_entry);

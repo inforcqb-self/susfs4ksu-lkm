@@ -16,11 +16,22 @@
  *       previously added; the _full_clone form also raises KSTAT_SPOOF_NLINK|KSTAT_SPOOF_SIZE.
  *   del <path> - remove one rule by its target pathname;   clear - remove all rules.
  *
- * Hook strategy (LTO on this GKI inlines the newfstatat chain vfs_fstatat -> vfs_statx ->
- * vfs_getattr -> cp_new_stat, so VFS-layer kprobes miss): the reliable hook is the return of
- * __arm64_sys_newfstatat, where the user statbuf is fully written.  Rewrite the requested fields
- * there via copy_to_user.  Field offsets are arm64 asm-generic struct stat.
+ * Hook strategy (LTO on this GKI inlines the stat chain vfs_fstatat -> vfs_statx -> vfs_getattr ->
+ * cp_new_stat, so VFS-layer kprobes miss): the reliable hook is the RETURN of the stat syscall,
+ * where the user statbuf is fully written - so this layer replaces the sys_call_table entries of
+ * the numbers below and rewrites the requested fields of the user buffer in the wrapper's tail,
+ * once the original has returned (see kstat_hooks[] and susfs_kstat_post()).  Native:
+ * newfstatat(79), fstat(80), statx(291).
+ * AArch32: fstatat64(327), stat64(195), lstat64(196), fstat64(197) -> struct stat64; stat(106),
+ * lstat(107), fstat(108) -> struct compat_stat; statx(397) -> the SAME struct statx as native
+ * (unistd32.h maps 397 to the native statx body, and struct statx is a fixed-width uapi struct, so
+ * only the pointers are 32-bit).  Field offsets are arm64 asm-generic struct stat / struct statx
+ * (offsetof + static_assert), the ARM EABI struct stat64 (hand-derived, see the note above
+ * STAT64_ST_DEV_OFF) and struct compat_stat (offsetof + static_assert).  The
+ * vfs_getattr kretprobe that used to stand behind this as a lower-layer fallback is GONE: its
+ * removal and what replaced it are explained in the note above struct kstat_call_counters.
  */
+
 #include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/uaccess.h>
@@ -41,8 +52,10 @@
 #include <linux/version.h>	/* LINUX_VERSION_CODE: the inode ctime accessor */
 #include "susfs_abi.h"
 #include "susfs_log.h"
-#include "susfs.h"	/* susfs_expose_proc */
+#include "susfs.h"	/* susfs_expose_proc, sus_path_dirent_filter(), SUS_NR_GETDENTS*_COMPAT */
+#include "susfs_fp_hook.h"	/* struct susfs_fp_hook + install/remove/drain: the table entries */
 #include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
+#include "ksu_allow_gate.h"	/* the control-node gate is su's own */
 #include "susfs_kprobe.h"
 
 /* KSTAT_SPOOF_* bits live in susfs_abi.h (upstream declares them in susfs.h next to struct
@@ -85,7 +98,7 @@ static DEFINE_MUTEX(kstat_lock);
 
 /* Table locking, in two tiers.  kstat_lock (mutex) serialises WRITERS and the /proc read, because
  * writers resolve paths and that sleeps.  kstat_table_lock (spinlock) guards the table for the
- * READERS - the sys_exit tracepoint and the vfs_getattr kretprobe, hot paths where kstat_lock
+ * READERS - the stat layer's entry tail and the show_map_vma kretprobe, hot paths where kstat_lock
  * cannot be taken; a reader holds it only long enough to copy the matching entry out and must never
  * copy_to_user under it.  Rule: resolve first (sleeping, outside), then swap (non-sleeping, inside) -
  * publishing a slot before it is filled is a bug (an empty slot used to be visible as soon as nkstat
@@ -174,9 +187,11 @@ static bool susfs_kstat_gate_ok(void)
  * kstat_table_lock; their callers hold kstat_lock, making the index they pass stable. */
 
 /* Cheapest possible gate for the READ paths: with nothing registered no lookup can match, which on
- * the sys_exit tracepoint saves the two copy_from_user() reads the spoofers do before matching, and
- * on the show_map_vma kprobe (still armed after a `clear`) and the vfs_getattr kretprobe saves an
- * uncontended spinlock per VMA / per lookup.  READ_ONCE is enough: nkstat is published only AFTER
+ * the stat layer's entry tail saves the two copy_from_user() reads the spoofers do before matching, and
+ * on the show_map_vma kprobe (still armed after a `clear`) saves an uncontended spinlock per VMA
+ * (the vfs_getattr kretprobe this sentence used to name is gone - see the note above struct
+ * kstat_call_counters).
+ * READ_ONCE is enough: nkstat is published only AFTER
  * the entry it counts has been written, under kstat_table_lock (kstat_table_append stores the entry,
  * then bumps the count), so a stale non-zero value only means work we used to do and a stale zero can
  * cost at most the single read racing the very first add; the authoritative test is the locked lookup.
@@ -465,8 +480,13 @@ static void kstat_maps_disarm(void)
 	mutex_unlock(&kstat_maps_ctl_lock);
 }
 
+struct kstat_call_state {
+	struct kstat_call_counters *cnt;
+	bool compat;
+};
+
 /* rewrite the requested fields of the native user statbuf */
-static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
+static bool susfs_kstat_spoof_statbuf(struct kstat_call_state *st, unsigned long statbuf)
 {
 	/* Snapshot, not a pointer into the table: a concurrent writer must not be able to retarget the
 	 * entry between the match and the copy_to_user below, which must not run under a spinlock. */
@@ -477,80 +497,133 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
 	unsigned int v32;
 	long long v64;
 	long sl;
+	bool rewrote = false;
 
-	if (susfs_kstat_table_empty())
-		return;
-	if (!susfs_kstat_gate_ok())
-		return;
+	if (susfs_kstat_table_empty()) {
+		atomic_inc(&st->cnt->miss_empty);
+		return false;
+	}
+	if (!susfs_kstat_gate_ok()) {
+		atomic_inc(&st->cnt->miss_gate);
+		return false;
+	}
 
-	if (copy_from_user(&ino, (void __user *)(statbuf + ST_INO_OFF), sizeof(ino)))
-		return;
-	if (copy_from_user(&dev, (void __user *)(statbuf + ST_DEV_OFF), sizeof(dev)))
-		return;
+	if (copy_from_user(&ino, (void __user *)(statbuf + ST_INO_OFF), sizeof(ino))) {
+		atomic_inc(&st->cnt->uaccess);
+		return false;
+	}
+	if (copy_from_user(&dev, (void __user *)(statbuf + ST_DEV_OFF), sizeof(dev))) {
+		atomic_inc(&st->cnt->uaccess);
+		return false;
+	}
 
-	if (!susfs_kstat_lookup(ino, dev, &snap))
-		return;
+	if (!susfs_kstat_lookup(ino, dev, &snap)) {
+		atomic_inc(&st->cnt->miss_lookup);
+		return false;
+	}
 
 	if (e->flags & KSTAT_SPOOF_INO) {
 		v = e->spoofed_ino;
-		if (copy_to_user((void __user *)(statbuf + ST_INO_OFF), &v, sizeof(v)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + ST_INO_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_DEV) {
 		v = e->spoofed_dev;
-		if (copy_to_user((void __user *)(statbuf + ST_DEV_OFF), &v, sizeof(v)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + ST_DEV_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_NLINK) {
 		v32 = e->spoofed_nlink;
-		if (copy_to_user((void __user *)(statbuf + ST_NLINK_OFF), &v32, sizeof(v32)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + ST_NLINK_OFF), &v32, sizeof(v32))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_SIZE) {
 		v64 = e->spoofed_size;
-		if (copy_to_user((void __user *)(statbuf + ST_SIZE_OFF), &v64, sizeof(v64)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + ST_SIZE_OFF), &v64, sizeof(v64))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_BLKSIZE) {
 		v32 = (unsigned int)e->spoofed_blksize;
-		if (copy_to_user((void __user *)(statbuf + ST_BLKSIZE_OFF), &v32, sizeof(v32)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + ST_BLKSIZE_OFF), &v32, sizeof(v32))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_BLOCKS) {
 		v64 = e->spoofed_blocks;
-		if (copy_to_user((void __user *)(statbuf + ST_BLOCKS_OFF), &v64, sizeof(v64)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + ST_BLOCKS_OFF), &v64, sizeof(v64))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_ATIME_TV_SEC) {
 		sl = e->spoofed_atime_tv_sec;
-		if (copy_to_user((void __user *)(statbuf + ST_ATIME_OFF), &sl, sizeof(sl)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + ST_ATIME_OFF), &sl, sizeof(sl))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_ATIME_TV_NSEC) {
 		v = e->spoofed_atime_tv_nsec;
-		if (copy_to_user((void __user *)(statbuf + ST_ATIME_NSEC_OFF), &v, sizeof(v)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + ST_ATIME_NSEC_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_MTIME_TV_SEC) {
 		sl = e->spoofed_mtime_tv_sec;
-		if (copy_to_user((void __user *)(statbuf + ST_MTIME_OFF), &sl, sizeof(sl)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + ST_MTIME_OFF), &sl, sizeof(sl))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_MTIME_TV_NSEC) {
 		v = e->spoofed_mtime_tv_nsec;
-		if (copy_to_user((void __user *)(statbuf + ST_MTIME_NSEC_OFF), &v, sizeof(v)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + ST_MTIME_NSEC_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_CTIME_TV_SEC) {
 		sl = e->spoofed_ctime_tv_sec;
-		if (copy_to_user((void __user *)(statbuf + ST_CTIME_OFF), &sl, sizeof(sl)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + ST_CTIME_OFF), &sl, sizeof(sl))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_CTIME_TV_NSEC) {
 		v = e->spoofed_ctime_tv_nsec;
-		if (copy_to_user((void __user *)(statbuf + ST_CTIME_NSEC_OFF), &v, sizeof(v)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + ST_CTIME_NSEC_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
+
+	if (!rewrote)
+		atomic_inc(&st->cnt->match_noflag);
+	else
+		atomic_inc(&st->cnt->rewrite);
+	return rewrote;
 }
 
 /* AArch32 (compat) statbuf layouts.  There are TWO, and which one a syscall fills is decided by
@@ -563,15 +636,21 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
  *   __NR_stat 106, __NR_lstat 107, __NR_fstat 108 -> struct compat_stat
  *       (arch/arm64/include/asm/compat.h) via cp_compat_stat().  They ARE mapped in this tree's
  *       arch/arm64/include/asm/unistd32.h (106 -> compat_sys_newstat, 107 -> newlstat, 108 ->
- *       newfstat), and an earlier note here claimed the opposite, so a 32-bit caller using
- *       stat()/lstat()/fstat() gets the real numbers while its stat64()/fstat64() are spoofed - a
- *       one-call oracle.  Wiring them needs their own struct compat_stat offsets (st_dev+0, st_ino+4,
- *       st_nlink+10, st_size+20, st_blksize+24, st_blocks+28, atime+32/36, mtime+40/44, ctime+48/52),
- *       which is not a copy of the table below, so it stays a separate change rather than half-done
- *       here.  They are listed so nobody concludes "compat = compat_stat" and wires the wrong
- *       offsets - which is what this code used to do: st_ino was read at +4, the HIGH half of st_dev
- *       in stat64 and always 0, so the lookup could never match (a match would have written into
- *       st_dev/st_rdev).
+ *       newfstat) and they ARE handled now, by susfs_kstat_spoof_compat_stat() below - the third
+ *       layout, whose offsets are pinned with offsetof()/static_assert() right after this comment.
+ *       Their key is the same (ino, new_encode_dev(dev)) the other families carry, so the rule table
+ *       and susfs_kstat_lookup() are shared; what differs is the FIELD WIDTHS: st_ino is 32-bit,
+ *       st_nlink is 16-bit and st_size/st_blksize/st_blocks are 32-bit compat_off_t, so the write
+ *       side refuses a value this struct cannot represent exactly where the kernel refuses it too
+ *       (cp_compat_stat() answers -EOVERFLOW for an ino/nlink that does not fit and for a size above
+ *       MAX_NON_LFS) - that is what the per-number `narrow` counter counts.
+ *       AArch32 statx 397 is NOT a layout of its own: unistd32.h maps it to the native statx body,
+ *       and struct statx is a fixed-width uapi struct, so the STATX offsets below serve it unchanged
+ *       (only the buffer pointer is 32-bit and goes through compat_ptr()).
+ *       Struct stat64 and struct compat_stat must never be confused: this is what an earlier version
+ *       of this file did - it read the lookup key from struct stat64's +4 (the HIGH half of its
+ *       64-bit st_dev) for the 106/107/108 buffers, so the key could never match, and a match would
+ *       have written into st_dev/st_rdev.
  *
  * ALIGNMENT (these numbers were established twice): compat_u64/compat_s64 are
  * __attribute__((aligned(4))) only when CONFIG_COMPAT_FOR_U64_ALIGNMENT is set
@@ -596,15 +675,109 @@ static void susfs_kstat_spoof_statbuf(unsigned long statbuf)
 #define STAT64_ST_INO_OFF       96	/* compat_u64 st_ino (also written; the KEY is read from +12) */
 #define STAT64_ST_SIZE          104
 
+/* struct compat_stat (the AArch32 stat()/lstat()/fstat() layout, 106/107/108).  Unlike the struct
+ * stat64 block above these are taken from the kernel's OWN type (linux/compat.h -> asm/compat.h),
+ * so a layout drift in any of the eight build variants fails the build instead of mis-writing a
+ * user buffer.  The numbers are identical on 5.15 and 6.6 (checked field by field); the asserts
+ * below are what keeps that true for 6.12/6.18 too.
+ *
+ * Field widths are the reason this needs its own write path and not a re-read of the stat64 one:
+ *   st_dev u32 (new_encode_dev, so the same key as every other family), st_ino u32, st_mode u16,
+ *   st_nlink u16, st_uid/st_gid u16, st_rdev u32, st_size/st_blksize/st_blocks s32 (compat_off_t),
+ *   st_atime/st_mtime/st_ctime s32 (old_time32_t) and their _nsec u32 (compat_ulong_t).
+ * cp_compat_stat() (fs/stat.c, identical in 5.15 and 6.6) writes exactly those, and it *refuses*
+ * three of them instead of truncating: an ino or nlink that does not fit its 32/16 bits, and a size
+ * above MAX_NON_LFS, all answer -EOVERFLOW.  The write-back below follows the same rule (skip the
+ * field, count it in `narrow`) rather than writing a value the kernel itself would never have put
+ * there.  st_blksize/st_blocks/the timestamps are plain assignments in the kernel, so those are
+ * written at their own width like it does. */
+#define COMPAT_STAT_ST_DEV_OFF		((int)offsetof(struct compat_stat, st_dev))
+#define COMPAT_STAT_ST_INO_OFF		((int)offsetof(struct compat_stat, st_ino))
+#define COMPAT_STAT_ST_NLINK_OFF	((int)offsetof(struct compat_stat, st_nlink))
+#define COMPAT_STAT_ST_SIZE_OFF		((int)offsetof(struct compat_stat, st_size))
+#define COMPAT_STAT_ST_BLKSIZE_OFF	((int)offsetof(struct compat_stat, st_blksize))
+#define COMPAT_STAT_ST_BLOCKS_OFF	((int)offsetof(struct compat_stat, st_blocks))
+#define COMPAT_STAT_ST_ATIME_OFF	((int)offsetof(struct compat_stat, st_atime))
+#define COMPAT_STAT_ST_ATIME_NSEC_OFF	((int)offsetof(struct compat_stat, st_atime_nsec))
+#define COMPAT_STAT_ST_MTIME_OFF	((int)offsetof(struct compat_stat, st_mtime))
+#define COMPAT_STAT_ST_MTIME_NSEC_OFF	((int)offsetof(struct compat_stat, st_mtime_nsec))
+#define COMPAT_STAT_ST_CTIME_OFF	((int)offsetof(struct compat_stat, st_ctime))
+#define COMPAT_STAT_ST_CTIME_NSEC_OFF	((int)offsetof(struct compat_stat, st_ctime_nsec))
+
+static_assert(offsetof(struct compat_stat, st_dev) == 0, "compat_stat.st_dev");
+static_assert(offsetof(struct compat_stat, st_ino) == 4, "compat_stat.st_ino");
+static_assert(offsetof(struct compat_stat, st_mode) == 8, "compat_stat.st_mode");
+static_assert(offsetof(struct compat_stat, st_nlink) == 10, "compat_stat.st_nlink");
+static_assert(offsetof(struct compat_stat, st_rdev) == 16, "compat_stat.st_rdev");
+static_assert(offsetof(struct compat_stat, st_size) == 20, "compat_stat.st_size");
+static_assert(offsetof(struct compat_stat, st_blksize) == 24, "compat_stat.st_blksize");
+static_assert(offsetof(struct compat_stat, st_blocks) == 28, "compat_stat.st_blocks");
+static_assert(offsetof(struct compat_stat, st_atime) == 32, "compat_stat.st_atime");
+static_assert(offsetof(struct compat_stat, st_atime_nsec) == 36, "compat_stat.st_atime_nsec");
+static_assert(offsetof(struct compat_stat, st_mtime) == 40, "compat_stat.st_mtime");
+static_assert(offsetof(struct compat_stat, st_mtime_nsec) == 44, "compat_stat.st_mtime_nsec");
+static_assert(offsetof(struct compat_stat, st_ctime) == 48, "compat_stat.st_ctime");
+static_assert(offsetof(struct compat_stat, st_ctime_nsec) == 52, "compat_stat.st_ctime_nsec");
+static_assert(sizeof(struct compat_stat) == 64, "compat_stat size");
+/* The widths the write-back has to respect (see the note above): if any of these ever changed, the
+ * `narrow` decisions below would silently become wrong. */
+static_assert(sizeof(((struct compat_stat *)0)->st_dev) == 4, "compat_stat.st_dev width");
+static_assert(sizeof(((struct compat_stat *)0)->st_ino) == 4, "compat_stat.st_ino width");
+static_assert(sizeof(((struct compat_stat *)0)->st_nlink) == 2, "compat_stat.st_nlink width");
+static_assert(sizeof(((struct compat_stat *)0)->st_size) == 4, "compat_stat.st_size width");
+static_assert(sizeof(((struct compat_stat *)0)->st_blksize) == 4, "compat_stat.st_blksize width");
+static_assert(sizeof(((struct compat_stat *)0)->st_blocks) == 4, "compat_stat.st_blocks width");
+static_assert(sizeof(((struct compat_stat *)0)->st_atime) == 4, "compat_stat.st_atime width");
+static_assert(sizeof(((struct compat_stat *)0)->st_atime_nsec) == 4, "compat_stat.st_atime_nsec width");
+
 /* ARM EABI syscall numbers that fill struct stat64 (arch/arm64/include/asm/unistd32.h; the
  * statbuf argument position is from fs/stat.c's COMPAT_SYSCALL_DEFINE2/4). */
+/* AArch32 stat numbers, from the 32-bit ARM table (arch/arm/tools/syscall.tbl) - an arm64 tree
+ * has no macro for them.  They are only reached for a task running that ABI: arm64's native
+ * 195/196/197 are shmctl/shmat/shmdt (whose second argument is an address or a small integer,
+ * not a statbuf) and its native 79/80 are newfstatat/fstat, which AArch32 numbers 79/80 give to
+ * settimeofday/getgroups. */
 #define COMPAT_FSTATAT64_NR	327	/* fstatat64(dfd, path, statbuf, flag) */
 #define COMPAT_STAT64_NR	195	/* stat64(path, statbuf) */
 #define COMPAT_LSTAT64_NR	196	/* lstat64(path, statbuf) */
 #define COMPAT_FSTAT64_NR	197	/* fstat64(fd, statbuf) */
+/* struct compat_stat trio: statbuf is args[1] in all three (COMPAT_SYSCALL_DEFINE2(newstat,
+ * filename, statbuf) and DEFINE2(newfstat, fd, statbuf) in fs/stat.c), and all three end in
+ * cp_compat_stat(). */
+#define COMPAT_STAT_NR		106	/* stat(path, struct compat_stat *) */
+#define COMPAT_LSTAT_NR		107	/* lstat(path, struct compat_stat *) */
+#define COMPAT_FSTAT_NR		108	/* fstat(fd, struct compat_stat *) */
+/* AArch32 statx: yes, 32-bit callers have it (unistd32.h:397), and it is the NATIVE statx body -
+ * fs/stat.c has no COMPAT_SYSCALL_DEFINE for statx on arm64 - filling the same 256-byte
+ * struct statx at a zero-extended 32-bit pointer.  statbuf is args[4] and the requested mask
+ * args[3], exactly as in the native case; only the counter differs (see KSTAT_COUNTERS above). */
+#define COMPAT_STATX_NR		397	/* statx(dfd, path, flags, mask, struct statx *) */
+
+struct kstat_nr_entry {
+	long nr;
+	const char *name;
+	struct kstat_call_counters *cnt;
+};
+
+static struct kstat_nr_entry kstat_nr_table[] = {
+	{ __NR_newfstatat, "newfstatat", &cnt_nfstatat },
+	{ __NR_fstat,      "fstat",      &cnt_nfstat },
+	{ __NR_statx,      "statx",      &cnt_statx },
+	{ COMPAT_FSTATAT64_NR, "fstatat64/compat", &cnt_fstatat64 },
+	{ COMPAT_STAT64_NR,    "stat64/compat",    &cnt_stat64 },
+	{ COMPAT_LSTAT64_NR,   "lstat64/compat",   &cnt_lstat64 },
+	{ COMPAT_FSTAT64_NR,   "fstat64/compat",   &cnt_fstat64 },
+	/* The struct compat_stat trio and AArch32 statx: separate rows on purpose - a 32-bit caller
+	 * that only ever uses stat()/lstat()/fstat() (no stat64) would otherwise be invisible in this
+	 * table, and that is precisely the case the offsets above exist for. */
+	{ COMPAT_STAT_NR,      "stat/compat",      &cnt_compat_stat },
+	{ COMPAT_LSTAT_NR,     "lstat/compat",     &cnt_compat_stat },
+	{ COMPAT_FSTAT_NR,     "fstat/compat",     &cnt_compat_stat },
+	{ COMPAT_STATX_NR,     "statx/compat",     &cnt_compat_statx },
+};
 
 /* compat (32-bit) statbuf: struct stat64 (see above) - the layout all four handled syscalls use. */
-static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
+static bool susfs_kstat_spoof_compat_statbuf(struct kstat_call_state *st, unsigned long statbuf)
 {
 	struct sus_kstat_snapshot snap;
 	const struct sus_kstat_snapshot *e = &snap;
@@ -612,114 +785,530 @@ static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
 	unsigned int ino = 0, dev = 0;
 	unsigned int v32;
 	int v;
+	bool rewrote = false;
 
-	if (susfs_kstat_table_empty())
-		return;
-	if (!susfs_kstat_gate_ok())
-		return;
+	if (susfs_kstat_table_empty()) {
+		atomic_inc(&st->cnt->miss_empty);
+		return false;
+	}
+	if (!susfs_kstat_gate_ok()) {
+		atomic_inc(&st->cnt->miss_gate);
+		return false;
+	}
 
-	/* Key lookup on what the kernel ACTUALLY filled: __st_ino at +12.  stat64 carries the
-	 * STAT64_HAS_BROKEN_ST_INO marker (arch/arm64/include/asm/stat.h), so cp_new_stat64() writes
-	 * __st_ino and leaves st_ino (+96) alone - reading the key from +96 would compare against
-	 * whatever the caller's buffer held and never match.  Both fields are written when spoofing, so
-	 * a libc that synthesises st_ino from __st_ino and one that reads st_ino directly both see the
-	 * spoofed value. */
-	if (copy_from_user(&ino, (void __user *)(statbuf + STAT64_ST_BROKEN_INO_OFF), sizeof(ino)))
-		return;
-	if (copy_from_user(&dev, (void __user *)(statbuf + STAT64_ST_DEV_OFF), sizeof(dev)))
-		return;
-	if (!susfs_kstat_lookup(ino, dev, &snap))
-		return;
+	if (copy_from_user(&ino, (void __user *)(statbuf + STAT64_ST_BROKEN_INO_OFF), sizeof(ino))) {
+		atomic_inc(&st->cnt->uaccess);
+		return false;
+	}
+	if (copy_from_user(&dev, (void __user *)(statbuf + STAT64_ST_DEV_OFF), sizeof(dev))) {
+		atomic_inc(&st->cnt->uaccess);
+		return false;
+	}
+	if (!susfs_kstat_lookup(ino, dev, &snap)) {
+		atomic_inc(&st->cnt->miss_lookup);
+		return false;
+	}
 
 	if (e->flags & KSTAT_SPOOF_INO) {
 		v32 = (unsigned int)e->spoofed_ino;
-		if (copy_to_user((void __user *)(statbuf + STAT64_ST_BROKEN_INO_OFF), &v32, sizeof(v32)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_BROKEN_INO_OFF), &v32, sizeof(v32))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
 		v64 = (unsigned long long)e->spoofed_ino;
-		if (copy_to_user((void __user *)(statbuf + STAT64_ST_INO_OFF), &v64, sizeof(v64)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_INO_OFF), &v64, sizeof(v64))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_DEV) {
 		v64 = (unsigned long long)e->spoofed_dev;
-		if (copy_to_user((void __user *)(statbuf + STAT64_ST_DEV_OFF), &v64, sizeof(v64)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_DEV_OFF), &v64, sizeof(v64))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_NLINK) {
 		v32 = (unsigned int)e->spoofed_nlink;
-		if (copy_to_user((void __user *)(statbuf + STAT64_ST_NLINK_OFF), &v32, sizeof(v32)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_NLINK_OFF), &v32, sizeof(v32))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_SIZE) {
 		v64 = (unsigned long long)e->spoofed_size;
-		if (copy_to_user((void __user *)(statbuf + STAT64_ST_SIZE_OFF), &v64, sizeof(v64)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_SIZE_OFF), &v64, sizeof(v64))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_BLKSIZE) {
 		v32 = (unsigned int)e->spoofed_blksize;
-		if (copy_to_user((void __user *)(statbuf + STAT64_ST_BLKSIZE_OFF), &v32, sizeof(v32)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_BLKSIZE_OFF), &v32, sizeof(v32))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_BLOCKS) {
 		v64 = (unsigned long long)e->spoofed_blocks;
-		if (copy_to_user((void __user *)(statbuf + STAT64_ST_BLOCKS_OFF), &v64, sizeof(v64)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_BLOCKS_OFF), &v64, sizeof(v64))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_ATIME_TV_SEC) {
 		v = (int)e->spoofed_atime_tv_sec;
-		if (copy_to_user((void __user *)(statbuf + STAT64_ST_ATIME_OFF), &v, sizeof(v)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_ATIME_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_ATIME_TV_NSEC) {
 		v32 = (unsigned int)e->spoofed_atime_tv_nsec;
-		if (copy_to_user((void __user *)(statbuf + STAT64_ST_ATIME_NSEC_OFF), &v32, sizeof(v32)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_ATIME_NSEC_OFF), &v32, sizeof(v32))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_MTIME_TV_SEC) {
 		v = (int)e->spoofed_mtime_tv_sec;
-		if (copy_to_user((void __user *)(statbuf + STAT64_ST_MTIME_OFF), &v, sizeof(v)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_MTIME_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_MTIME_TV_NSEC) {
 		v32 = (unsigned int)e->spoofed_mtime_tv_nsec;
-		if (copy_to_user((void __user *)(statbuf + STAT64_ST_MTIME_NSEC_OFF), &v32, sizeof(v32)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_MTIME_NSEC_OFF), &v32, sizeof(v32))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_CTIME_TV_SEC) {
 		v = (int)e->spoofed_ctime_tv_sec;
-		if (copy_to_user((void __user *)(statbuf + STAT64_ST_CTIME_OFF), &v, sizeof(v)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_CTIME_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
 	if (e->flags & KSTAT_SPOOF_CTIME_TV_NSEC) {
 		v32 = (unsigned int)e->spoofed_ctime_tv_nsec;
-		if (copy_to_user((void __user *)(statbuf + STAT64_ST_CTIME_NSEC_OFF), &v32, sizeof(v32)))
-			return;
+		if (copy_to_user((void __user *)(statbuf + STAT64_ST_CTIME_NSEC_OFF), &v32, sizeof(v32))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
 	}
+
+	if (!rewrote)
+		atomic_inc(&st->cnt->match_noflag);
+	else
+		atomic_inc(&st->cnt->rewrite);
+	return rewrote;
 }
 
-/* sys_exit tracepoint: the user statbuf is fully written by now, and syscall_get_arguments()
- * still returns the original args (verified: args[2] == statbuf), so no per-cpu state is needed.
- *
- * It carries two features: the stat family below, and sus_path's directory-listing rewrite.  The
- * listing side needs its own gate - see the note above sus_path_dirent_layout_id(): a syscall
- * number alone does not identify a call (arm64's native 141 is getpriority where AArch32 numbers
- * getdents 141), so the number is only ever read together with the caller's ABI.
- *
- * COST: this callback runs for every syscall exit, so the three checks below (is_compat_task(),
- * syscall_get_nr(), the classifier) are paid on all of them - a function call and a couple of
- * compares.  The callback itself was measured when the stat family moved onto it at ~28 ns per
- * syscall (getpid 113 -> 141 ns); that number is the baseline this adds to, and it has not been
- * re-measured for the listing filter (no device was available for this change).
- *
- * KNOWN BOUNDARY (ptrace): arch/arm64/kernel/syscall.c writes regs->syscallno = scno BEFORE
- * syscall_trace_enter(), so a tracer that rewrites a getdents64 into another syscall still gets
- * classified here as getdents64; the parse then fails on a buffer that is not a dirent chain and
- * counts a rewrite failure.  It cannot corrupt anything (every read is bounded by d_reclen and
- * every failure answers "nothing filtered"), and the stat family below has the same exposure. */
-static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
+/* struct compat_stat (AArch32 stat/lstat/fstat, 106/107/108).  Same rule table and same lookup key
+ * as everything else; what this function exists for is the different field widths - see the note
+ * above COMPAT_STAT_ST_DEV_OFF.  The three refusals below mirror cp_compat_stat()'s -EOVERFLOW
+ * guards (ino, nlink, size): the kernel never puts a value in those fields that does not fit, so
+ * neither does this - the field keeps what the kernel wrote and the `narrow` counter is bumped,
+ * rather than handing the caller a truncated (and, for size, negative) number. */
+static bool susfs_kstat_spoof_compat_stat(struct kstat_call_state *st, unsigned long statbuf)
 {
-	unsigned long args[6];
-	bool compat = is_compat_task();
-	long nr = syscall_get_nr(current, regs);
+	struct sus_kstat_snapshot snap;
+	const struct sus_kstat_snapshot *e = &snap;
+	unsigned int ino = 0, dev = 0, v32;
+	unsigned short v16;
+	int v;
+	bool rewrote = false;
+
+	if (susfs_kstat_table_empty()) {
+		atomic_inc(&st->cnt->miss_empty);
+		return false;
+	}
+	if (!susfs_kstat_gate_ok()) {
+		atomic_inc(&st->cnt->miss_gate);
+		return false;
+	}
+
+	if (copy_from_user(&ino, (void __user *)(statbuf + COMPAT_STAT_ST_INO_OFF), sizeof(ino))) {
+		atomic_inc(&st->cnt->uaccess);
+		return false;
+	}
+	if (copy_from_user(&dev, (void __user *)(statbuf + COMPAT_STAT_ST_DEV_OFF), sizeof(dev))) {
+		atomic_inc(&st->cnt->uaccess);
+		return false;
+	}
+	if (!susfs_kstat_lookup(ino, dev, &snap)) {
+		atomic_inc(&st->cnt->miss_lookup);
+		return false;
+	}
+
+	if (e->flags & KSTAT_SPOOF_INO) {
+		if (e->spoofed_ino > 0xffffffffUL) {
+			atomic_inc(&st->cnt->narrow);
+		} else {
+			v32 = (unsigned int)e->spoofed_ino;
+			if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_INO_OFF), &v32, sizeof(v32))) {
+				atomic_inc(&st->cnt->uaccess);
+				return false;
+			}
+			rewrote = true;
+		}
+	}
+	if (e->flags & KSTAT_SPOOF_DEV) {
+		/* new_encode_dev() of a dev_t is a u32 by construction: always representable. */
+		v32 = (unsigned int)e->spoofed_dev;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_DEV_OFF), &v32, sizeof(v32))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_NLINK) {
+		if (e->spoofed_nlink > 0xffffU) {
+			atomic_inc(&st->cnt->narrow);
+		} else {
+			v16 = (unsigned short)e->spoofed_nlink;
+			if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_NLINK_OFF), &v16, sizeof(v16))) {
+				atomic_inc(&st->cnt->uaccess);
+				return false;
+			}
+			rewrote = true;
+		}
+	}
+	if (e->flags & KSTAT_SPOOF_SIZE) {
+		if (e->spoofed_size < 0 || e->spoofed_size > 0x7fffffffLL) {
+			atomic_inc(&st->cnt->narrow);
+		} else {
+			v = (int)e->spoofed_size;
+			if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_SIZE_OFF), &v, sizeof(v))) {
+				atomic_inc(&st->cnt->uaccess);
+				return false;
+			}
+			rewrote = true;
+		}
+	}
+	if (e->flags & KSTAT_SPOOF_BLKSIZE) {
+		v = (int)e->spoofed_blksize;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_BLKSIZE_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_BLOCKS) {
+		v = (int)e->spoofed_blocks;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_BLOCKS_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_ATIME_TV_SEC) {
+		v = (int)e->spoofed_atime_tv_sec;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_ATIME_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_ATIME_TV_NSEC) {
+		v32 = (unsigned int)e->spoofed_atime_tv_nsec;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_ATIME_NSEC_OFF), &v32, sizeof(v32))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_MTIME_TV_SEC) {
+		v = (int)e->spoofed_mtime_tv_sec;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_MTIME_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_MTIME_TV_NSEC) {
+		v32 = (unsigned int)e->spoofed_mtime_tv_nsec;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_MTIME_NSEC_OFF), &v32, sizeof(v32))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_CTIME_TV_SEC) {
+		v = (int)e->spoofed_ctime_tv_sec;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_CTIME_OFF), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_CTIME_TV_NSEC) {
+		v32 = (unsigned int)e->spoofed_ctime_tv_nsec;
+		if (copy_to_user((void __user *)(statbuf + COMPAT_STAT_ST_CTIME_NSEC_OFF), &v32, sizeof(v32))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+
+	if (!rewrote)
+		atomic_inc(&st->cnt->match_noflag);
+	else
+		atomic_inc(&st->cnt->rewrite);
+	return rewrote;
+}
+
+#define STATX_F_INO		STATX_INO
+#define STATX_F_NLINK		STATX_NLINK
+#define STATX_F_SIZE		STATX_SIZE
+#define STATX_F_BLOCKS		STATX_BLOCKS
+
+struct susfs_statx_offs {
+	unsigned short dev, dev_minor, ino, nlink, size, blksize, blocks;
+	unsigned short atime_sec, atime_nsec, mtime_sec, mtime_nsec,
+		       ctime_sec, ctime_nsec, mask;
+};
+
+static const struct susfs_statx_offs kstat_statx_offs = {
+	.dev = offsetof(struct statx, stx_dev_major),
+	/* statx is the one family that hands out the two device halves separately; the table
+	 * stores the encoded value st_dev carries, so the lookup key has to be rebuilt from
+	 * both halves before the lookup below. */
+	.dev_minor = offsetof(struct statx, stx_dev_minor),
+	.ino = offsetof(struct statx, stx_ino),
+	.nlink = offsetof(struct statx, stx_nlink),
+	.size = offsetof(struct statx, stx_size),
+	.blksize = offsetof(struct statx, stx_blksize),
+	.blocks = offsetof(struct statx, stx_blocks),
+	.atime_sec = offsetof(struct statx, stx_atime),
+	.atime_nsec = offsetof(struct statx, stx_atime) + offsetof(struct timespec64, tv_nsec),
+	.mtime_sec = offsetof(struct statx, stx_mtime),
+	.mtime_nsec = offsetof(struct statx, stx_mtime) + offsetof(struct timespec64, tv_nsec),
+	.ctime_sec = offsetof(struct statx, stx_ctime),
+	.ctime_nsec = offsetof(struct statx, stx_ctime) + offsetof(struct timespec64, tv_nsec),
+	.mask = offsetof(struct statx, stx_mask),
+};
+
+static_assert(offsetof(struct statx, stx_mask) == 0x00, "statx.stx_mask");
+static_assert(offsetof(struct statx, stx_blksize) == 0x04, "statx.stx_blksize");
+static_assert(offsetof(struct statx, stx_attributes) == 0x08, "statx.stx_attributes");
+static_assert(offsetof(struct statx, stx_nlink) == 0x10, "statx.stx_nlink");
+static_assert(offsetof(struct statx, stx_ino) == 0x20, "statx.stx_ino");
+static_assert(offsetof(struct statx, stx_size) == 0x28, "statx.stx_size");
+static_assert(offsetof(struct statx, stx_blocks) == 0x30, "statx.stx_blocks");
+static_assert(offsetof(struct statx, stx_atime) == 0x40, "statx.stx_atime");
+static_assert(offsetof(struct statx, stx_btime) == 0x50, "statx.stx_btime");
+static_assert(offsetof(struct statx, stx_ctime) == 0x60, "statx.stx_ctime");
+static_assert(offsetof(struct statx, stx_mtime) == 0x70, "statx.stx_mtime");
+
+static_assert(offsetof(struct statx, stx_dev_major) == 0x88, "statx.stx_dev_major");
+static_assert(offsetof(struct statx, stx_dev_minor) == 0x8c, "statx.stx_dev_minor");
+static_assert(offsetof(struct statx, stx_mnt_id) == 0x90, "statx.stx_mnt_id");
+static_assert(sizeof(struct statx) == 256, "statx size");
+static_assert(sizeof(((struct statx *)0)->stx_ino) == 8, "statx stx_ino is u64");
+static_assert(sizeof(((struct statx *)0)->stx_size) == 8, "statx stx_size is u64");
+
+/* Read a field of the buffer, write the spoofed value back only when the mask carries the field. */
+#define STATX_FIELD_U64(off, val, mbit)						\
+	do {									\
+		if (eff & (mbit)) {						\
+			u64 __v = (u64)(val);					\
+										\
+			if (copy_to_user((void __user *)(sbuf + (off)), &__v,	\
+					 sizeof(__v))) {			\
+				atomic_inc(&st->cnt->uaccess);			\
+				return false;					\
+			}							\
+			rewrote = true;						\
+		}								\
+	} while (0)
+
+#define STATX_FIELD_S32(off, val, mbit)						\
+	do {									\
+		if (eff & (mbit)) {						\
+			s32 __v = (s32)(val);					\
+			u32 __u = (u32)__v;					\
+										\
+			if (copy_to_user((void __user *)(sbuf + (off)), &__u,	\
+					 sizeof(__u))) {			\
+				atomic_inc(&st->cnt->uaccess);			\
+				return false;					\
+			}							\
+			rewrote = true;						\
+		}								\
+	} while (0)
+
+#define STATX_FIELD_U32(off, val, mbit)						\
+	do {									\
+		if (eff & (mbit)) {						\
+			u32 __v = (u32)(val);					\
+										\
+			if (copy_to_user((void __user *)(sbuf + (off)), &__v,	\
+					 sizeof(__v))) {			\
+				atomic_inc(&st->cnt->uaccess);			\
+				return false;					\
+			}							\
+			rewrote = true;						\
+		}								\
+	} while (0)
+
+/* returns true when the buffer was really changed */
+static bool susfs_kstat_spoof_statx(struct kstat_call_state *st, unsigned long sbuf,
+				    u32 req_mask)
+{
+	const struct susfs_statx_offs *o = &kstat_statx_offs;
+	struct sus_kstat_snapshot snap;
+	const struct sus_kstat_snapshot *e = &snap;
+	unsigned long ino = 0;
+	unsigned int dev = 0;
+	u32 dev_major = 0, dev_minor = 0;
+	u32 buf_mask = 0, eff;
+	bool rewrote = false;
+
+	if (susfs_kstat_table_empty()) {
+		atomic_inc(&st->cnt->miss_empty);
+		return false;
+	}
+	if (!susfs_kstat_gate_ok()) {
+		atomic_inc(&st->cnt->miss_gate);
+		return false;
+	}
+
+	if (copy_from_user(&ino, (void __user *)(sbuf + o->ino), sizeof(ino))) {
+		atomic_inc(&st->cnt->uaccess);
+		return false;
+	}
+	/* statx reports the device as two halves, while the table stores the ENCODED value the
+	 * other stat families put in st_dev (sus_kstat_entry.dev): read both halves and encode
+	 * them the same way, or the lookup key can never match and the whole statx spoof is dead.
+	 * (Reading only stx_dev_major here is exactly that bug.) */
+	if (copy_from_user(&dev_major, (void __user *)(sbuf + o->dev), sizeof(dev_major))) {
+		atomic_inc(&st->cnt->uaccess);
+		return false;
+	}
+	if (copy_from_user(&dev_minor, (void __user *)(sbuf + o->dev_minor), sizeof(dev_minor))) {
+		atomic_inc(&st->cnt->uaccess);
+		return false;
+	}
+	dev = new_encode_dev(MKDEV(dev_major, dev_minor));
+	if (copy_from_user(&buf_mask, (void __user *)(sbuf + o->mask), sizeof(buf_mask))) {
+		atomic_inc(&st->cnt->uaccess);
+		return false;
+	}
+
+	if (!susfs_kstat_lookup(ino, dev, &snap)) {
+		atomic_inc(&st->cnt->miss_lookup);
+		return false;
+	}
+
+	eff = req_mask | buf_mask;
+
+	if (e->flags & KSTAT_SPOOF_INO)
+		STATX_FIELD_U64(o->ino, e->spoofed_ino, STATX_F_INO);
+	if (e->flags & KSTAT_SPOOF_NLINK)
+		STATX_FIELD_U32(o->nlink, e->spoofed_nlink, STATX_F_NLINK);
+	if (e->flags & KSTAT_SPOOF_SIZE)
+		STATX_FIELD_U64(o->size, e->spoofed_size, STATX_F_SIZE);
+	if (e->flags & KSTAT_SPOOF_BLOCKS)
+		STATX_FIELD_U64(o->blocks, e->spoofed_blocks, STATX_F_BLOCKS);
+
+	if (e->flags & KSTAT_SPOOF_BLKSIZE) {
+		s32 v = (s32)e->spoofed_blksize;
+
+		if (copy_to_user((void __user *)(sbuf + o->blksize), &v, sizeof(v))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+	if (e->flags & KSTAT_SPOOF_ATIME_TV_SEC)
+		STATX_FIELD_S32(o->atime_sec, e->spoofed_atime_tv_sec, STATX_ATIME);
+	if (e->flags & KSTAT_SPOOF_ATIME_TV_NSEC)
+		STATX_FIELD_U32(o->atime_nsec, e->spoofed_atime_tv_nsec, STATX_ATIME);
+	if (e->flags & KSTAT_SPOOF_MTIME_TV_SEC)
+		STATX_FIELD_S32(o->mtime_sec, e->spoofed_mtime_tv_sec, STATX_MTIME);
+	if (e->flags & KSTAT_SPOOF_MTIME_TV_NSEC)
+		STATX_FIELD_U32(o->mtime_nsec, e->spoofed_mtime_tv_nsec, STATX_MTIME);
+	if (e->flags & KSTAT_SPOOF_CTIME_TV_SEC)
+		STATX_FIELD_S32(o->ctime_sec, e->spoofed_ctime_tv_sec, STATX_CTIME);
+	if (e->flags & KSTAT_SPOOF_CTIME_TV_NSEC)
+		STATX_FIELD_U32(o->ctime_nsec, e->spoofed_ctime_tv_nsec, STATX_CTIME);
+
+	if ((e->flags & KSTAT_SPOOF_DEV) && (eff & STATX_BASIC_STATS)) {
+		unsigned int enc = (unsigned int)e->spoofed_dev;
+		/* stx_dev_major/minor are u32 each: write all four bytes of each half.  Writing a u16
+		 * per half would leave the upper bytes of the real device number behind for any minor
+		 * that does not fit 16 bits. */
+		unsigned int maj = (enc & 0xfff00u) >> 8;
+		unsigned int min = MINOR(new_decode_dev(enc));
+
+		if (copy_to_user((void __user *)(sbuf + o->dev), &maj, sizeof(maj))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		if (copy_to_user((void __user *)(sbuf + o->dev_minor), &min, sizeof(min))) {
+			atomic_inc(&st->cnt->uaccess);
+			return false;
+		}
+		rewrote = true;
+	}
+
+	if (!rewrote) {
+		atomic_inc(&st->cnt->match_noflag);
+		return false;
+	}
+
+	atomic_inc(&st->cnt->rewrite);
+	return true;
+}
+
+/* The post-check, called at the TAIL of the table-entry wrapper (see kstat_hooks[] below) instead
+ * of from a entry tail.  Two features ride it, exactly as before: the stat family below,
+ * and sus_path's directory-listing rewrite.  The listing side still needs its own gate - see the
+ * note above sus_path_dirent_layout_id(): a syscall number alone does not identify a call (arm64's
+ * native 141 is getpriority where AArch32 numbers getdents 141), so the number is only ever read
+ * together with the caller's ABI - and here the ABI is not a guess, it is which table the wrapper
+ * was installed in.
+ *
+ * WHAT CHANGED, AND WHY.  As a tracepoint this ran for EVERY syscall exit, so is_compat_task(),
+ * syscall_get_nr() and the two classifiers below were paid on all of them - measured at ~28 ns per
+ * syscall when the stat family moved onto it (getpid 113 -> 141 ns), and re-measured at the time of
+ * this change as 126 ns without the tracepoint vs 151 ns with it (three runs each, +25..31 ns), on
+ * the same device the module ships to.  As a wrapper tail it runs only for the thirteen numbers in
+ * kstat_hooks[], and both the "which ABI" and the "which syscall" questions are answered by which
+ * table entry was called rather than by a test that every syscall has to pay for.  Nothing is lost:
+ * the arguments arrive from the wrapper, which copies them out of regs BEFORE calling the original
+ * (a syscall's return value lands in regs->regs[0], so reading them afterwards would hand the
+ * spoofers the return value in place of the first argument).
+ *
+ * The old KNOWN BOUNDARY (ptrace) went away with the tracepoint: arch/arm64/kernel/syscall.c
+ * writes regs->syscallno = scno before syscall_trace_enter(), so a tracer that rewrote a getdents64
+ * into another syscall was still classified as getdents64 here.  A tracer cannot rewrite which
+ * table entry the kernel calls, so this dispatch is on what was really called.
+ *
+ * `out` is the wrapper's answer and starts at the original's return value: the stat family rewrites
+ * the caller's buffer and leaves the return value alone, while the listing filter shortens the count
+ * and must hand that back - the tracepoint did it with syscall_set_return_value(), which a wrapper
+ * has no regs to do it with. */
+static __nocfi void susfs_kstat_post(long nr, bool compat, const unsigned long *args,
+				     long ret, long *out)
+{
+	struct kstat_call_counters *c;
+	struct kstat_call_state st;
 	int lay = sus_path_dirent_layout_id(nr, compat);
 
 	if (lay >= 0) {
@@ -727,141 +1316,356 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 
 		/* Nothing to rewrite when the syscall produced no bytes (an error, or the end of
 		 * the directory), and the arguments must not be read before the gate said this
-		 * really is a listing call.  The same goes for the armed flag: with no rules yet
-		 * (or with no_extra) there is nothing to do, and that is the common case. */
-		if (ret <= 0 || !sus_path_dirent_armed())
+		 * really is a listing call: the filter is told "no buffer, nothing produced" and
+		 * returns without touching the caller's memory.
+		 * The number alone does not identify the call (native 141 is getpriority, not
+		 * the AArch32 getdents): sus_path_dirent_layout_id() gates it on the ABI, so
+		 * anything that is not really a listing leaves here before the arguments are
+		 * read.
+		 * The armed flag is not tested here any more: sus_path_dirent_filter() checks
+		 * it itself, together with ret <= 0 and a NULL buffer, so a second gate at this
+		 * call site only duplicated it while looking like coverage. */
+		if (ret <= 0) {
+			sus_path_dirent_filter(lay, 0, ret);
 			return;
-		syscall_get_arguments(current, regs, args);
+		}
+		/* The arguments come from the wrapper now - see the note above. */
 		rc = sus_path_dirent_filter(lay,
 					    compat ? (unsigned long)compat_ptr((u32)args[1])
 						   : args[1],
 					    ret);
 		if (rc != ret)
-			syscall_set_return_value(current, regs, 0, rc);
+			*out = rc;
 		return;
 	}
 
-	if (ret != 0)
+	/* ---- stat family: number -> counters -> argument positions ----
+	 * Gated on the ABI for the same reason as the listing numbers above: on arm64 the native
+	 * table's 195/196/197 are shmctl/shmat/shmdt, and shmat's second argument is a mapped
+	 * address - read as a compat struct stat64 buffer it would hand back whatever the caller
+	 * happens to have there, and on a rule hit rewrite it. */
+	if (compat) {
+		switch (nr) {
+		case COMPAT_FSTATAT64_NR:
+			c = &cnt_fstatat64;
+			break;
+		case COMPAT_STAT64_NR:
+			c = &cnt_stat64;
+			break;
+		case COMPAT_LSTAT64_NR:
+			c = &cnt_lstat64;
+			break;
+		case COMPAT_FSTAT64_NR:
+			c = &cnt_fstat64;
+			break;
+		case COMPAT_STAT_NR:
+		case COMPAT_LSTAT_NR:
+		case COMPAT_FSTAT_NR:
+			/* struct compat_stat, NOT struct stat64 - see the offsets and the widths
+			 * above; the two differ in every field after st_ino. */
+			c = &cnt_compat_stat;
+			break;
+		case COMPAT_STATX_NR:
+			/* A counter of its own: "64-bit statx is spoofed" says nothing about the
+			 * 32-bit one, and mixing them is how a 32-bit-only gap stayed invisible. */
+			c = &cnt_compat_statx;
+			break;
+		default:
+			c = NULL;
+			break;
+		}
+	} else {
+		switch (nr) {
+		case __NR_newfstatat:
+			c = &cnt_nfstatat;
+			break;
+		case __NR_fstat:
+			/* fstat(fd, statbuf): the buffer is args[1], not args[2]. */
+			c = &cnt_nfstat;
+			break;
+		case __NR_statx:
+			c = &cnt_statx;
+			break;
+		default:
+			c = NULL;
+			break;
+		}
+	}
+
+	if (!c) {
+		/* A listing number cannot reach this point any more: the gate at the top of this
+		 * function answers both getdents ABIs before the stat switch, so only the stat
+		 * range is worth noting here. */
+		if (nr >= KSTAT_NR_SCAN_LO && nr <= KSTAT_NR_SCAN_HI)
+			kstat_note_unlisted(nr);
 		return;
-	syscall_get_arguments(current, regs, args);
+	}
+
+	/* Whitelisted: from here on only this number's counters move. */
+	if (ret != 0) {
+		atomic_inc(&c->ret_err);
+		return;
+	}
+	atomic_inc(&c->calls);
+
+	st.cnt = c;
+	st.compat = compat;	/* the ABI that selected the number above */
 
 	/* The statbuf argument is NOT the same one for every syscall, so the NULL check has to live
 	 * inside each branch: fstat64(fd, statbuf) keeps it in args[1], and checking args[2] first
 	 * made every 32-bit fstat64() return early - the rule applied to fstatat64, not to fstat64. */
-	if (compat) {
-		switch (nr) {
-		case COMPAT_FSTATAT64_NR:
-			susfs_kstat_spoof_compat_statbuf((unsigned long)compat_ptr((u32)args[2]));
-			break;
-		/* stat64/lstat64/fstat64: all three keep statbuf in args[1], and all three fill the
-		 * same struct stat64 this helper expects. */
-		case COMPAT_STAT64_NR:
-		case COMPAT_LSTAT64_NR:
-		case COMPAT_FSTAT64_NR:
-			susfs_kstat_spoof_compat_statbuf((unsigned long)compat_ptr((u32)args[1]));
-			break;
+	/* Argument positions differ per number, so this stays a number switch - but only numbers
+	 * the gate above selected for THIS ABI can reach it, and the two ABIs' number sets
+	 * (79/80/291 native; 106/107/108, 195/196/197, 327, 397 compat) do not overlap, so it needs
+	 * no gate of its own. */
+	switch (nr) {
+	case __NR_newfstatat:
+		/* The arguments come from the wrapper now - see the note above. */
+		if (!args[2]) {
+			atomic_inc(&c->no_buf);
+			return;
 		}
-	} else {
-		if (nr != __NR_newfstatat)
+		susfs_kstat_spoof_statbuf(&st, args[2]);
+		return;
+	case __NR_fstat:
+		/* The arguments come from the wrapper now - see the note above. */
+		if (!args[1]) {
+			atomic_inc(&c->no_buf);
 			return;
-		if (!args[2])
+		}
+		susfs_kstat_spoof_statbuf(&st, args[1]);
+		return;
+	case __NR_statx:
+	case COMPAT_STATX_NR:	/* 397 IS the native statx body: same buffer, same mask, 32-bit ptr */
+
+		/* The arguments come from the wrapper now - see the note above. */
+		if (!args[4]) {
+			atomic_inc(&c->no_buf);
 			return;
-		susfs_kstat_spoof_statbuf(args[2]);
+		}
+		susfs_kstat_spoof_statx(&st,
+			st.compat ? (unsigned long)compat_ptr((u32)args[4]) : args[4],
+			(u32)args[3]);
+		return;
+	case COMPAT_FSTATAT64_NR:
+
+		/* The arguments come from the wrapper now - see the note above. */
+		if (!args[2]) {
+			atomic_inc(&c->no_buf);
+			return;
+		}
+		susfs_kstat_spoof_compat_statbuf(&st, (unsigned long)compat_ptr((u32)args[2]));
+		return;
+	case COMPAT_STAT64_NR:
+	case COMPAT_LSTAT64_NR:
+	case COMPAT_FSTAT64_NR:
+
+		/* The arguments come from the wrapper now - see the note above. */
+		if (!args[1]) {
+			atomic_inc(&c->no_buf);
+			return;
+		}
+		susfs_kstat_spoof_compat_statbuf(&st, (unsigned long)compat_ptr((u32)args[1]));
+		return;
+	case COMPAT_STAT_NR:
+	case COMPAT_LSTAT_NR:
+	case COMPAT_FSTAT_NR:
+
+		/* stat(path, statbuf), lstat(path, statbuf), fstat(fd, statbuf): the buffer is
+		 * args[1] in all three (fs/stat.c: COMPAT_SYSCALL_DEFINE2(newstat, filename,
+		 * statbuf) and DEFINE2(newfstat, fd, statbuf)).  struct compat_stat, so the
+		 * write-back is susfs_kstat_spoof_compat_stat(), not the one above. */
+		/* The arguments come from the wrapper now - see the note above. */
+		if (!args[1]) {
+			atomic_inc(&c->no_buf);
+			return;
+		}
+		susfs_kstat_spoof_compat_stat(&st, (unsigned long)compat_ptr((u32)args[1]));
+		return;
 	}
 }
 
-/* fallback: some paths (vfs_fstat, statx, direct callers) still reach the exported vfs_getattr
- * copy; rewrite the kernel kstat there too. */
-struct vfs_getattr_args {
-	const struct path *path;
-	struct kstat *stat;
-};
+/* ==== the sys_call_table entries that drive the post-check above ==== */
+/*
+ * This is what replaced the stat layer's table entries.  Thirteen entries, one per (number, ABI)
+ * pair, because the two questions that tracepoint had to answer on EVERY syscall - "which ABI is
+ * the caller" and "which number is this" - are both answered here by which entry was called: a
+ * 32-bit task never reaches sys_call_table, and the compat table does not share its numbering with
+ * the native one (AArch32 141 is getdents where arm64's 141 is getpriority; its 195/196/197 are
+ * stat64/lstat64/fstat64 where the native ones are shmctl/shmat/shmdt).
+ *
+ * WHY IT MOVED.  As a tracepoint the callback ran on every syscall exit and paid
+ * is_compat_task(), syscall_get_nr() and two classifiers for all of them.  Measured on the device
+ * before this change, on the getpid line of susfs_bench (no entry of ours is involved there, so it
+ * is the cost of whatever fires on every syscall):
+ *
+ *     kstat layer forced off (fail_layer=6)   126 / 126 / 126 ns   <- no tracepoint
+ *     everything armed                        151 / 150 / 151 ns   <- tracepoint registered
+ *
+ * i.e. +25..31 ns per syscall, on every syscall, whether or not it is one this module cares about.
+ * Now only these thirteen numbers pay anything, and both classifiers went away with the tracepoint.
+ *
+ * Arguments are copied out of regs BEFORE the original runs: a syscall's return value is written
+ * into regs->regs[0] (arch/arm64/kernel/syscall.c, and the compat entry point does the same), so
+ * reading them afterwards would hand the spoofers the return value in place of the first argument.
+ *
+ * __nocfi is mandatory on the wrapper, for the reason susfs_opath.c states at length: it is reached
+ * by an indirect call out of the kernel's table, and it calls the original the same way.  The NULL
+ * test on the slot is not about publish order - susfs_fp_install() publishes the original before it
+ * writes the table - it is what turns a future mistake there into one failed syscall instead of a
+ * jump to address 0.
+ *
+ * nr < 0 means "this number exists in the compat table only" (struct susfs_fp_hook spells that
+ * out); every AArch32 entry below is one of those, because its native namesake is a different
+ * syscall.  The .sym fields are for the diagnostic dump only - susfs_fp_dump_entry() resolves them
+ * by name - so one that does not match what this kernel calls the entry shows up as "no symbol"
+ * there and changes nothing about the hook itself.
+ */
+static susfs_syscall_fn_t kstat_orig_nfstatat;
+static susfs_syscall_fn_t kstat_orig_fstat;
+static susfs_syscall_fn_t kstat_orig_statx;
+static susfs_syscall_fn_t kstat_orig_getdents64;
+static susfs_syscall_fn_t kstat_orig_compat_stat64;
+static susfs_syscall_fn_t kstat_orig_compat_lstat64;
+static susfs_syscall_fn_t kstat_orig_compat_fstat64;
+static susfs_syscall_fn_t kstat_orig_compat_fstatat64;
+static susfs_syscall_fn_t kstat_orig_compat_stat;
+static susfs_syscall_fn_t kstat_orig_compat_lstat;
+static susfs_syscall_fn_t kstat_orig_compat_fstat;
+static susfs_syscall_fn_t kstat_orig_compat_statx;
+static susfs_syscall_fn_t kstat_orig_compat_getdents64;
+static susfs_syscall_fn_t kstat_orig_compat_getdents;
 
-static int kr_vfs_getattr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+#define SUSFS_KSTAT_WRAPPER(fn, slot, nrval, combat)			\
+	static __nocfi long fn(const struct pt_regs *regs)		\
+	{								\
+		susfs_syscall_fn_t orig = READ_ONCE(slot);		\
+		unsigned long a[6];					\
+		long ret, out;						\
+									\
+		if (!orig)						\
+			return -ENOSYS;					\
+		/* susfs_syscall_fn_t takes a const regs (the table's own type) while	\
+		 * syscall_get_arguments() asks for a non-const one it only reads - the	\
+		 * cast is what that difference costs, and nothing here writes regs. */	\
+		syscall_get_arguments(current, (struct pt_regs *)regs, a);	\
+		ret = orig(regs);					\
+		out = ret;						\
+		susfs_kstat_post(nrval, combat, a, ret, &out);		\
+		return out;						\
+	}
+
+SUSFS_KSTAT_WRAPPER(kstat_wrap_nfstatat, kstat_orig_nfstatat, __NR_newfstatat, false)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_fstat, kstat_orig_fstat, __NR_fstat, false)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_statx, kstat_orig_statx, __NR_statx, false)
+/* getdents64 does NOT use the shared macro: sus_dirent.c can answer it without the original
+ * ever writing to the caller's buffer, which is what removes the two tells the post-hoc
+ * filter leaves (the d_ino = 0 placeholder, and the scrub that can be faulted).  When that
+ * layer declines - unresolved symbol, prefilter=0 - this falls back to exactly what the
+ * macro does, so hiding continues either way. */
+static __nocfi long kstat_wrap_getdents64(const struct pt_regs *regs)
 {
-	struct vfs_getattr_args *a = (struct vfs_getattr_args *)ri->data;
+	susfs_syscall_fn_t orig = READ_ONCE(kstat_orig_getdents64);
+	unsigned long a[6];
+	long ret, out;
 
-	a->path = (const struct path *)regs->regs[0];
-	a->stat = (struct kstat *)regs->regs[1];
-	return 0;
+	if (!orig)
+		return -ENOSYS;
+	if (susfs_dirent_prefilter(regs, &out, false))
+		return out;
+	syscall_get_arguments(current, (struct pt_regs *)regs, a);
+	ret = orig(regs);
+	out = ret;
+	susfs_kstat_post(__NR_getdents64, false, a, ret, &out);
+	return out;
+}
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_stat64, kstat_orig_compat_stat64, COMPAT_STAT64_NR, true)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_lstat64, kstat_orig_compat_lstat64, COMPAT_LSTAT64_NR, true)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_fstat64, kstat_orig_compat_fstat64, COMPAT_FSTAT64_NR, true)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_fstatat64, kstat_orig_compat_fstatat64, COMPAT_FSTATAT64_NR, true)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_stat, kstat_orig_compat_stat, COMPAT_STAT_NR, true)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_lstat, kstat_orig_compat_lstat, COMPAT_LSTAT_NR, true)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_fstat, kstat_orig_compat_fstat, COMPAT_FSTAT_NR, true)
+SUSFS_KSTAT_WRAPPER(kstat_wrap_compat_statx, kstat_orig_compat_statx, COMPAT_STATX_NR, true)
+static __nocfi long kstat_wrap_compat_getdents64(const struct pt_regs *regs)
+{
+	susfs_syscall_fn_t orig = READ_ONCE(kstat_orig_compat_getdents64);
+	unsigned long a[6];
+	long ret, out;
+
+	if (!orig)
+		return -ENOSYS;
+	if (susfs_dirent_prefilter(regs, &out, false))
+		return out;
+	syscall_get_arguments(current, (struct pt_regs *)regs, a);
+	ret = orig(regs);
+	out = ret;
+	susfs_kstat_post(SUS_NR_GETDENTS64_COMPAT, true, a, ret, &out);
+	return out;
 }
 
-static void susfs_kstat_spoof_kstat(struct inode *inode, struct kstat *stat)
+static __nocfi long kstat_wrap_compat_getdents(const struct pt_regs *regs)
 {
-	struct sus_kstat_snapshot snap;
-	const struct sus_kstat_snapshot *e = &snap;
+	susfs_syscall_fn_t orig = READ_ONCE(kstat_orig_compat_getdents);
+	unsigned long a[6];
+	long ret, out;
 
-	if (susfs_kstat_table_empty())
-		return;
-	if (!inode || !stat)
-		return;
-	if (!susfs_kstat_gate_ok())
-		return;
-	if (!susfs_kstat_lookup(inode->i_ino, new_encode_dev(inode->i_sb->s_dev),
-				&snap))
-		return;
-	if (e->flags & KSTAT_SPOOF_INO)
-		stat->ino = e->spoofed_ino;
-	if (e->flags & KSTAT_SPOOF_DEV)
-		stat->dev = new_decode_dev(e->spoofed_dev);
-	if (e->flags & KSTAT_SPOOF_NLINK)
-		stat->nlink = e->spoofed_nlink;
-	if (e->flags & KSTAT_SPOOF_SIZE)
-		stat->size = e->spoofed_size;
-	if (e->flags & KSTAT_SPOOF_BLKSIZE)
-		stat->blksize = e->spoofed_blksize;
-	if (e->flags & KSTAT_SPOOF_BLOCKS)
-		stat->blocks = e->spoofed_blocks;
-	if (e->flags & KSTAT_SPOOF_ATIME_TV_SEC)
-		stat->atime.tv_sec = e->spoofed_atime_tv_sec;
-	if (e->flags & KSTAT_SPOOF_ATIME_TV_NSEC)
-		stat->atime.tv_nsec = e->spoofed_atime_tv_nsec;
-	if (e->flags & KSTAT_SPOOF_MTIME_TV_SEC)
-		stat->mtime.tv_sec = e->spoofed_mtime_tv_sec;
-	if (e->flags & KSTAT_SPOOF_MTIME_TV_NSEC)
-		stat->mtime.tv_nsec = e->spoofed_mtime_tv_nsec;
-	if (e->flags & KSTAT_SPOOF_CTIME_TV_SEC)
-		stat->ctime.tv_sec = e->spoofed_ctime_tv_sec;
-	if (e->flags & KSTAT_SPOOF_CTIME_TV_NSEC)
-		stat->ctime.tv_nsec = e->spoofed_ctime_tv_nsec;
+	if (!orig)
+		return -ENOSYS;
+	if (susfs_dirent_prefilter(regs, &out, true))
+		return out;
+	syscall_get_arguments(current, (struct pt_regs *)regs, a);
+	ret = orig(regs);
+	out = ret;
+	susfs_kstat_post(SUS_NR_GETDENTS_COMPAT, true, a, ret, &out);
+	return out;
 }
 
-/* Counters, because "registered" and "reached" are different claims everywhere in this module:
- * the sys_exit rewrite handles newfstatat, and this fallback covers the paths that never go
- * through that wrapper (fstat(2), statx(2), any caller of the exported vfs_getattr).  If these
- * stay at 0 through a run that calls fstat/statx, the probe is dead weight and has to go - the
- * same test the maps hook, __d_path and pin_user_pages_remote failed. */
-static atomic_t n_gattr_hits = ATOMIC_INIT(0);
-static atomic_t n_gattr_spoofs = ATOMIC_INIT(0);
+static struct susfs_fp_hook kstat_hooks[] = {
+	{ .nr = __NR_newfstatat, .nr_compat = 0, .name = "kstat/newfstatat",
+	  .sym = "__arm64_sys_newfstatat",
+	  .wrapper = kstat_wrap_nfstatat, .orig_slot = &kstat_orig_nfstatat },
+	{ .nr = __NR_fstat, .nr_compat = 0, .name = "kstat/fstat",
+	  .sym = "__arm64_sys_fstat",
+	  .wrapper = kstat_wrap_fstat, .orig_slot = &kstat_orig_fstat },
+	{ .nr = __NR_statx, .nr_compat = 0, .name = "kstat/statx",
+	  .sym = "__arm64_sys_statx",
+	  .wrapper = kstat_wrap_statx, .orig_slot = &kstat_orig_statx },
+	{ .nr = __NR_getdents64, .nr_compat = 0, .name = "kstat/getdents64",
+	  .sym = "__arm64_sys_getdents64",
+	  .wrapper = kstat_wrap_getdents64, .orig_slot = &kstat_orig_getdents64 },
 
-static int kr_vfs_getattr_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
-{
-	struct vfs_getattr_args *a = (struct vfs_getattr_args *)ri->data;
-	struct inode *inode;
-	struct sus_kstat_snapshot snap;
-
-	if (regs_return_value(regs) != 0)
-		return 0;
-	if (!a->path || !a->path->dentry || !a->stat)
-		return 0;
-	inode = a->path->dentry->d_inode;
-
-	atomic_inc(&n_gattr_hits);
-	if (inode && susfs_kstat_gate_ok() &&
-	    susfs_kstat_lookup(inode->i_ino, new_encode_dev(inode->i_sb->s_dev),
-			       &snap))
-		atomic_inc(&n_gattr_spoofs);
-
-	susfs_kstat_spoof_kstat(inode, a->stat);
-	return 0;
-}
-
-static struct kretprobe krp_vfs_getattr = {
-	.kp.symbol_name = "vfs_getattr",
-	.entry_handler = kr_vfs_getattr_entry,
-	.handler = kr_vfs_getattr_ret,
-	.data_size = sizeof(struct vfs_getattr_args),
-	.maxactive = 64,
+	/* The AArch32 half.  nr stays -1 for every one of them. */
+	{ .nr = -1, .nr_compat = COMPAT_STAT64_NR, .name = "kstat/compat stat64",
+	  .sym = "__arm64_compat_sys_stat64",
+	  .wrapper = kstat_wrap_compat_stat64, .orig_slot_compat = &kstat_orig_compat_stat64 },
+	{ .nr = -1, .nr_compat = COMPAT_LSTAT64_NR, .name = "kstat/compat lstat64",
+	  .sym = "__arm64_compat_sys_lstat64",
+	  .wrapper = kstat_wrap_compat_lstat64, .orig_slot_compat = &kstat_orig_compat_lstat64 },
+	{ .nr = -1, .nr_compat = COMPAT_FSTAT64_NR, .name = "kstat/compat fstat64",
+	  .sym = "__arm64_compat_sys_fstat64",
+	  .wrapper = kstat_wrap_compat_fstat64, .orig_slot_compat = &kstat_orig_compat_fstat64 },
+	{ .nr = -1, .nr_compat = COMPAT_FSTATAT64_NR, .name = "kstat/compat fstatat64",
+	  .sym = "__arm64_compat_sys_fstatat64",
+	  .wrapper = kstat_wrap_compat_fstatat64, .orig_slot_compat = &kstat_orig_compat_fstatat64 },
+	{ .nr = -1, .nr_compat = COMPAT_STAT_NR, .name = "kstat/compat stat",
+	  .sym = "__arm64_compat_sys_newstat",
+	  .wrapper = kstat_wrap_compat_stat, .orig_slot_compat = &kstat_orig_compat_stat },
+	{ .nr = -1, .nr_compat = COMPAT_LSTAT_NR, .name = "kstat/compat lstat",
+	  .sym = "__arm64_compat_sys_newlstat",
+	  .wrapper = kstat_wrap_compat_lstat, .orig_slot_compat = &kstat_orig_compat_lstat },
+	{ .nr = -1, .nr_compat = COMPAT_FSTAT_NR, .name = "kstat/compat fstat",
+	  .sym = "__arm64_compat_sys_newfstat",
+	  .wrapper = kstat_wrap_compat_fstat, .orig_slot_compat = &kstat_orig_compat_fstat },
+	{ .nr = -1, .nr_compat = COMPAT_STATX_NR, .name = "kstat/compat statx",
+	  .sym = "__arm64_compat_sys_statx",
+	  .wrapper = kstat_wrap_compat_statx, .orig_slot_compat = &kstat_orig_compat_statx },
+	{ .nr = -1, .nr_compat = SUS_NR_GETDENTS64_COMPAT, .name = "kstat/compat getdents64",
+	  .sym = "__arm64_compat_sys_getdents64",
+	  .wrapper = kstat_wrap_compat_getdents64, .orig_slot_compat = &kstat_orig_compat_getdents64 },
+	{ .nr = -1, .nr_compat = SUS_NR_GETDENTS_COMPAT, .name = "kstat/compat getdents",
+	  .sym = "__arm64_compat_sys_getdents",
+	  .wrapper = kstat_wrap_compat_getdents, .orig_slot_compat = &kstat_orig_compat_getdents },
 };
 
 /* ---- path resolution + rule management (original SUSFS semantics) ---- */
@@ -900,11 +1704,16 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
 	 * accessors!"), so reading it stopped compiling: "no member named 'i_ctime' in 'struct inode'".
 	 * inode_get_ctime() returns the very same struct timespec64 by value, and this gate is
 	 * release-aligned as well as upstream-aligned: v6.6 added the accessor upstream and is also the
-	 * GKI tree boundary.  i_atime/i_mtime were NOT renamed here - upstream split them into time64_t
-	 * i_atime_sec/i_mtime_sec plus u32 i_atime_nsec/i_mtime_nsec, read through inode_get_atime()/
-	 * inode_get_mtime(), in v6.11, which is not a release this module builds for - so those two keep
-	 * being read directly. */
+	 * GKI tree boundary.  i_atime/i_mtime went the same way one move later: v6.11 split them into
+	 * time64_t i_atime_sec/i_mtime_sec plus u32 i_atime_nsec/i_mtime_nsec, read through
+	 * inode_get_atime()/inode_get_mtime() - which reassemble the very same struct timespec64 by
+	 * value, and are what the second #if below uses; reading the old fields directly no longer
+	 * compiles there.  The gate is on 6.12 rather than on 6.11 because 6.11 is not a GKI kernel:
+	 * the header trees this module is built against are 6.6 (old fields) and 6.12/6.18 (accessors). */
 	struct timespec64 ctime;
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+	struct timespec64 atime, mtime;
 #endif
 
 	err = kern_path(path, 0, &p);
@@ -919,6 +1728,10 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	ctime = inode_get_ctime(inode);
 #endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+	atime = inode_get_atime(inode);
+	mtime = inode_get_mtime(inode);
+#endif
 
 	e->target_ino = inode->i_ino;
 	e->target_dev = new_encode_dev(inode->i_sb->s_dev);
@@ -926,10 +1739,17 @@ static int susfs_kstat_fill_from_path(struct sus_kstat_entry *e, const char *pat
 	e->spoofed_dev = new_encode_dev(inode->i_sb->s_dev);
 	e->spoofed_nlink = inode->i_nlink;
 	e->spoofed_size = inode->i_size;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+	e->spoofed_atime_tv_sec = atime.tv_sec;
+	e->spoofed_atime_tv_nsec = atime.tv_nsec;
+	e->spoofed_mtime_tv_sec = mtime.tv_sec;
+	e->spoofed_mtime_tv_nsec = mtime.tv_nsec;
+#else
 	e->spoofed_atime_tv_sec = inode->i_atime.tv_sec;
 	e->spoofed_atime_tv_nsec = inode->i_atime.tv_nsec;
 	e->spoofed_mtime_tv_sec = inode->i_mtime.tv_sec;
 	e->spoofed_mtime_tv_nsec = inode->i_mtime.tv_nsec;
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	e->spoofed_ctime_tv_sec = ctime.tv_sec;
 	e->spoofed_ctime_tv_nsec = ctime.tv_nsec;
@@ -1183,38 +2003,45 @@ static const struct proc_ops kstat_proc_ops = {
 
 static struct proc_dir_entry *kstat_proc_entry;
 
-static bool kstat_tp_registered;
-static bool kstat_krp_registered;
-
-/* sus_path's listing filter rides this tracepoint but does not register it (the stat family
- * here does), so it has to be able to tell whether the ride exists: with the registration
- * failed, the filter would be silently dead while sus_path still reported itself armed. */
-bool susfs_kstat_tracepoint_armed(void)
-{
-	return READ_ONCE(kstat_tp_registered);
-}
+/* How many of kstat_hooks[] are actually in place: this layer's armed state, and what its log line
+ * reports.  The entry tail that used to be registered here is gone - the entries' comment
+ * above says why and what it cost. */
+static int kstat_hooks_armed;
 
 int susfs_kstat_init(void)
 {
 	int rc;
+	int i;
 
-	/* The hooks are armed UNCONDITIONALLY, and that is not cosmetic: the supercall interface
+	/* The entries are armed UNCONDITIONALLY, and that is not cosmetic: the supercall interface
 	 * (CMD_SUSFS_ADD_SUS_KSTAT) can install rules with no /proc node at all, so skipping
 	 * registration when expose_proc=0 silently turned the whole feature into a no-op - rules
-	 * accepted, never applied.  expose_proc decides whether the node exists, nothing else. */
-	rc = register_trace_sys_exit(kstat_sys_exit, NULL);
-	if (rc)
-		pr_warn("register_trace_sys_exit failed %d\n", rc);
-	else
-		kstat_tp_registered = true;
+	 * accepted, never applied.  expose_proc decides whether the node exists, nothing else.
+	 *
+	 * One entry at a time, and never fatal for the others - the same shape susfs_opath.c uses: a
+	 * number that cannot be installed leaves that one entry answering the kernel's own way while
+	 * the rest still work, and the log above names it.  Nothing here is a tracepoint any more, so
+	 * the reset rule in kernel/susfs_kprobe.h (about a probe's address field surviving a failed
+	 * registration) has no bearing on it. */
+	for (i = 0; i < (int)ARRAY_SIZE(kstat_hooks); i++) {
+		struct susfs_fp_hook *h = &kstat_hooks[i];
 
-	rc = register_kretprobe(&krp_vfs_getattr);
-	if (rc) {
-		susfs_krp_forget_addr(&krp_vfs_getattr);
-		pr_warn("register_kretprobe(vfs_getattr) failed %d\n", rc);
-	} else {
-		kstat_krp_registered = true;
+		rc = susfs_fp_install(h);
+		if (rc) {
+			pr_warn("kstat: %s not installed (%d) - that entry answers the kernel's own way\n",
+				h->name, rc);
+			continue;
+		}
+		kstat_hooks_armed++;
 	}
+	if (!kstat_hooks_armed) {
+		pr_warn("kstat: none of the %u entries could be installed - the stat family and the dirent rewrite stay off\n",
+			(unsigned int)ARRAY_SIZE(kstat_hooks));
+		return -ENOENT;
+	}
+	if (kstat_hooks_armed < (int)ARRAY_SIZE(kstat_hooks))
+		pr_warn("kstat: %d of %u entries installed (the log above names the rest)\n",
+			kstat_hooks_armed, (unsigned int)ARRAY_SIZE(kstat_hooks));
 
 	/* 0777 is deliberate, not an oversight.  inode_permission() runs the DAC check BEFORE
 	 * security_inode_permission(), so a node the app cannot open hands it EACCES - "this exists,
@@ -1232,24 +2059,33 @@ int susfs_kstat_init(void)
 			(int)susfs_expose_proc, (int)sus_path_lsm_active());
 	}
 
-	SUSFS_LOGI("kstat armed: %d rules (tp=%d krp=%d proc=%d)\n", nkstat,
-		kstat_tp_registered, kstat_krp_registered,
+	SUSFS_LOGI("kstat armed: %d rules (%d/%u table entries installed, proc=%d); stat rewrite + sus_path dirent rewrite ride those entries\n",
+		nkstat, kstat_hooks_armed, (unsigned int)ARRAY_SIZE(kstat_hooks),
 		kstat_proc_entry != NULL);
 	return 0;
 }
 
 void susfs_kstat_exit(void)
 {
+	int i;
+
 	kstat_maps_disarm();
-	if (kstat_krp_registered) {
-		unregister_kretprobe(&krp_vfs_getattr);
-		susfs_krp_forget_addr(&krp_vfs_getattr);
-		kstat_krp_registered = false;
+
+	/* Every entry is restored first and the drain runs after all of them: restoring stops new
+	 * callers, and susfs_fp_drain() is what covers a task that already picked one of our wrappers
+	 * out of the table - the same order, and the same reason, as susfs_opath_exit().  Idempotent
+	 * (guarded on `installed` and on the count), because this runs both for the rollback of a
+	 * failed load and for the unload of a loaded module. */
+	for (i = 0; i < (int)ARRAY_SIZE(kstat_hooks); i++) {
+		struct susfs_fp_hook *h = &kstat_hooks[i];
+
+		if (!h->installed)
+			continue;
+		susfs_fp_remove(h);
 	}
-	if (kstat_tp_registered) {
-		unregister_trace_sys_exit(kstat_sys_exit, NULL);
-		tracepoint_synchronize_unregister();
-		kstat_tp_registered = false;
+	if (kstat_hooks_armed) {
+		susfs_fp_drain();
+		kstat_hooks_armed = 0;
 	}
 	if (kstat_proc_entry) {
 		proc_remove(kstat_proc_entry);
@@ -1285,20 +2121,50 @@ static int kstat_proc_show(struct seq_file *m, void *v)
 		}
 	}
 	mutex_unlock(&kstat_lock);
+
 	/* "armed" is not "fired": the maps hook has to be readable the same way the other feature
 	 * hooks are, or a rewrite that never happens looks identical to one that works. */
 	seq_printf(m, "maps: armed=%d hits=%d rewrites=%d\n",
 		   kstat_maps_registered, atomic_read(&n_kstat_map_hits),
 		   atomic_read(&n_kstat_map_rewrites));
-	seq_printf(m, "vfs_getattr fallback: gattr_hits=%d gattr_spoofs=%d\n",
-		   atomic_read(&n_gattr_hits), atomic_read(&n_gattr_spoofs));
+
+	{
+		unsigned int i;
+
+		for (i = 0; i < ARRAY_SIZE(kstat_nr_table); i++) {
+			struct kstat_call_counters *c = kstat_nr_table[i].cnt;
+
+			seq_printf(m,
+				   "stat nr %-16s (%ld): ok=%d rw=%d | err=%d nobuf=%d empty=%d gate=%d lookup=%d noflag=%d uacc=%d narrow=%d\n",
+				   kstat_nr_table[i].name, kstat_nr_table[i].nr,
+				   atomic_read(&c->calls), atomic_read(&c->rewrite),
+				   atomic_read(&c->ret_err), atomic_read(&c->no_buf),
+				   atomic_read(&c->miss_empty), atomic_read(&c->miss_gate),
+				   atomic_read(&c->miss_lookup), atomic_read(&c->match_noflag),
+				   atomic_read(&c->uaccess), atomic_read(&c->narrow));
+		}
+		seq_printf(m, "stat unlisted-nr hits=%d (stat-range numbers the dispatcher did not know: last %d seen: %ld %ld %ld %ld %ld %ld %ld %ld)\n",
+			   atomic_read(&n_kstat_unlisted), (int)KSTAT_UNLISTED_SEEN,
+			   kstat_unlisted_seen[0], kstat_unlisted_seen[1],
+			   kstat_unlisted_seen[2], kstat_unlisted_seen[3],
+			   kstat_unlisted_seen[4], kstat_unlisted_seen[5],
+			   kstat_unlisted_seen[6], kstat_unlisted_seen[7]);
+	}
+
+	{
+		char line[512];
+		int n = sus_path_dirent_stat_line(line, sizeof(line));
+
+		if (n > 0)
+			seq_write(m, line, min_t(int, n, (int)sizeof(line) - 1));
+	}
 	return 0;
 }
 
 static int kstat_proc_open(struct inode *inode, struct file *file)
 {
 	/* root-only, like kstat_proc_open() above - 0777 is deliberate (see susfs_kstat_init()) */
-	if (current_uid().val != 0)
+	if (!susfs_control_visible())
 		return -ENOENT;
 	return single_open(file, kstat_proc_show, NULL);
 }
@@ -1331,7 +2197,7 @@ static ssize_t kstat_proc_write(struct file *file, const char __user *buf,
 
 	/* Same gate as kstat_proc_open(): open() alone is not enough - an fd opened by root and
 	 * handed on would keep working, which is why the sibling files check both. */
-	if (current_uid().val != 0)
+	if (!susfs_control_visible())
 		return -ENOENT;
 
 	if (len >= sizeof(cmd))
