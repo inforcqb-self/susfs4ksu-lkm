@@ -12,31 +12,94 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   package:
     runs-on: ubuntu-latest
     steps:
+      # Pinned to the tag, including a workflow_dispatch: the module scripts, LICENSE and the
+      # build-ddk digest list must come from the release's tree, not from whatever branch the
+      # dispatch ran on.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Resolve tag
+      # The ZIP is packed from the build that the tag's commit produced, never from the
+      # release's hand-uploaded assets: a stale .ko or one built from an unpushed branch
+      # would otherwise pack and verify cleanly.  A tag with no successful build run is an
+      # error, not something to paper over with whatever is attached.
+      - name: Resolve tag and build run
         id: t
-        run: echo "tag=${{ github.event.release.tag_name || inputs.tag }}" >> "$GITHUB_OUTPUT"
-      - name: Download release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
-          mkdir -p assets
-          gh release download "${{ steps.t.outputs.tag }}" --repo "${{ github.repository }}" \
-            --pattern 'susfs_guard_lkm-*.ko' --pattern 'susfs_insmod' --dir assets
+          set -euo pipefail
+          git fetch --tags --force origin
+          sha=$(git rev-parse --verify "refs/tags/$TAG^{commit}")
+          # --event push: a PR run builds the merge tree, not the tag's commit, and its
+          # GITHUB_SHA only points at the PR head.  A tag whose commit has no push run fails.
+          run=$(gh run list --repo "${{ github.repository }}" --workflow build-ddk.yml --event push \
+                  --commit "$sha" --limit 50 --json databaseId,conclusion \
+                  --jq '[.[] | select(.conclusion == "success")][0].databaseId')
+          if [ -z "$run" ] || [ "$run" = "null" ]; then
+            echo "::error::no successful build-ddk.yml run for $TAG ($sha) - refusing to package release assets"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+      - name: Download the build artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ steps.t.outputs.run }}
+        run: |
+          set -euo pipefail
+          mkdir -p build assets
+          gh run download "$RUN" --repo "${{ github.repository }}" \
+            --pattern 'susfs_guard_lkm.ko-*' --dir build
+          # A single --name download extracts the artifact's files directly into --dir.
+          gh run download "$RUN" --repo "${{ github.repository }}" \
+            --name susfs_insmod --dir build/loader
+          for d in build/susfs_guard_lkm.ko-*; do
+            kmi="${d#build/susfs_guard_lkm.ko-}"
+            cp "$d/susfs_guard_lkm.ko" "assets/susfs_guard_lkm-$kmi.ko"
+          done
+          cp build/loader/susfs_insmod assets/susfs_insmod
+          ls -l assets
+      - name: Collect the toolchain images
+        run: |
+          python - <<'EOF'
+          import json, pathlib, re
+          text = pathlib.Path(".github/workflows/build-ddk.yml").read_text()
+          images = sorted(set(re.findall(
+              r"ghcr\.io/ylarod/ddk-min:[^@\s]+@sha256:[0-9a-f]{64}", text)))
+          if len(images) != 8:
+              raise SystemExit(f"expected 8 digest-pinned DDK images, found {len(images)}")
+          pathlib.Path("ddk-images.json").write_text(json.dumps(images, indent=2) + "\n")
+          EOF
       - name: Package module
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          SHA: ${{ steps.t.outputs.sha }}
+          RUN: ${{ steps.t.outputs.run }}
         run: |
+          set -euo pipefail
           python tools/pack_module.py --ko-dir assets --insmod assets/susfs_insmod \
-            --tag "${{ steps.t.outputs.tag }}" \
-            --out "dist/susfs_guard_lkm-module-${{ steps.t.outputs.tag }}-arm64.zip"
+            --tag "$TAG" --sha "$SHA" --run-id "$RUN" --ddk-images ddk-images.json \
+            --out "dist/susfs_guard_lkm-module-$TAG-arm64.zip"
+          ls -l dist
+      # The .ko set and the loader are attached from the same build, so the release page's
+      # assets are as traceable as the ZIP's provenance.json.
       - name: Attach to release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ steps.t.outputs.tag }}" dist/*.zip --repo "${{ github.repository }}" --clobber
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" assets/*.ko assets/susfs_insmod \
+            --repo "${{ github.repository }}" --clobber
+          gh release upload "$TAG" dist/*.zip --repo "${{ github.repository }}" --clobber
