@@ -523,11 +523,9 @@ jobs:
           #     warning text would have been false for it.
           #
           # --- capabilities the module can reach by more than one spelling.  Which spelling a
-          #     tree carries is decided by its version, so a missing HALF is the normal case and
-          #     says nothing: 6.12+ has static_calls_table and no security_hook_heads, 5.10 has
-          #     __flush_dcache_area and neither of its successors, and so on.  Warning per symbol
-          #     made every variant noisy enough to hide a real absence, so warn per CAPABILITY:
-          #     only when no alternative is complete does the module actually lose the feature.
+          #     tree carries is version-related, but vendor backports exist; the groups below
+          #     follow the code's compile-time branch per variant instead of accepting a union of
+          #     every spelling a tree might have.
           check_group() {
             _label="$1"; shift
             _ok=""; _detail=""
@@ -547,20 +545,71 @@ jobs:
               echo "::warning::$_label: $S (variant $V) carries none of its spellings ($(echo $_detail)) - this feature cannot arm on this kernel"
             fi
           }
-          check_group "LSM hook table"      "static_calls_table+lsm_active_cnt" "security_hook_heads"
-          check_group "mount id allocator"  "mnt_id_xa+__xa_alloc+__xa_erase" "mnt_id_ida+ida_alloc_range+ida_free"
-          # patch_memory resolves the dcache and icache helpers SEPARATELY and accepts either
-          # spelling for each, so a kernel may legitimately carry a mixed pair.  One group per
-          # helper: locking them together reported NONE for a mix the module handles.
-          check_group "dcache flush"        "dcache_clean_inval_poc" "__flush_dcache_area"
-          check_group "icache flush"        "caches_clean_inval_pou" "__flush_icache_range"
-          check_group "kallsyms by name"    "kallsyms_on_each_match_symbol" "kallsyms_lookup_name" "kallsyms_on_each_symbol"
-          # close_fd_get_file() (5.15, fs/file.c:795) became file_close_fd() (6.11+,
-          # fs/file.c:778), and the two do NOT share a signature: the first returns an int
-          # status and fills an out-param, the second returns the file.  susfs_opath keeps a
-          # separate pointer per name, so either one arms the layer - which is what this
-          # group asserts.  Listed flat, one of the two would warn on every single variant.
-          check_group "fd-table close helper" "close_fd_get_file" "file_close_fd"
+          # fd: < 6.1 resolves close_fd_get_file only; 6.1+ tries close_fd_get_file then
+          # file_close_fd with one pointer.  LSM: < 6.12 security_hook_heads, >= 6.12
+          # static_calls_table.  mount: < 6.18 ida trio, 6.18 xarray trio.  kallsyms:
+          # kallsyms_on_each_match_symbol is USED only from 6.6 on (the gate is empirical: the
+          # 6.1 tree carries the symbol but the module does not bootstrap it there); below 6.6
+          # it is kallsyms_lookup_name plus kallsyms_lookup or kallsyms_on_each_symbol.
+          case "$V" in
+            android12-5.10|android13-5.10|android13-5.15|android14-5.15)
+              lsm_alt="security_hook_heads"
+              mount_alt="mnt_id_ida+ida_alloc_range+ida_free"
+              fd2=""
+              ks1="kallsyms_lookup_name+kallsyms_lookup"
+              ks2="kallsyms_lookup_name+kallsyms_on_each_symbol"
+              ks3=""
+              ;;
+            android14-6.1)
+              lsm_alt="security_hook_heads"
+              mount_alt="mnt_id_ida+ida_alloc_range+ida_free"
+              fd2="file_close_fd"
+              ks1="kallsyms_lookup_name+kallsyms_lookup"
+              ks2="kallsyms_lookup_name+kallsyms_on_each_symbol"
+              ks3=""
+              ;;
+            android15-6.6)
+              lsm_alt="security_hook_heads"
+              mount_alt="mnt_id_ida+ida_alloc_range+ida_free"
+              fd2="file_close_fd"
+              ks1="kallsyms_on_each_match_symbol"
+              ks2="kallsyms_lookup_name+kallsyms_lookup"
+              ks3="kallsyms_lookup_name+kallsyms_on_each_symbol"
+              ;;
+            android16-6.12)
+              lsm_alt="static_calls_table"
+              mount_alt="mnt_id_ida+ida_alloc_range+ida_free"
+              fd2="file_close_fd"
+              ks1="kallsyms_on_each_match_symbol"
+              ks2="kallsyms_lookup_name+kallsyms_lookup"
+              ks3="kallsyms_lookup_name+kallsyms_on_each_symbol"
+              ;;
+            android17-6.18)
+              lsm_alt="static_calls_table"
+              mount_alt="mnt_id_xa+__xa_alloc+__xa_erase"
+              fd2="file_close_fd"
+              ks1="kallsyms_on_each_match_symbol"
+              ks2="kallsyms_lookup_name+kallsyms_lookup"
+              ks3="kallsyms_lookup_name+kallsyms_on_each_symbol"
+              ;;
+            *)
+              echo "::error::no per-variant capability map for $V"
+              exit 1
+              ;;
+          esac
+          check_group "LSM hook table" "$lsm_alt"
+          check_group "mount id allocator" "$mount_alt"
+          if [ -n "$fd2" ]; then
+            check_group "fd-table close helper" "close_fd_get_file" "$fd2"
+          else
+            check_group "fd-table close helper" "close_fd_get_file"
+          fi
+          check_group "kallsyms by name" "$ks1" "$ks2" ${ks3:+"$ks3"}
+          # lsm_active_cnt is informational: only static_calls_table gates arming (lsm_hook.c
+          # pr_err's and continues when the count is absent).
+          if [ "$V" = "android16-6.12" ] || [ "$V" = "android17-6.18" ]; then
+            printf '  %-34s %s   (informational; absence is non-fatal)\n' "lsm_active_cnt" "$(sym_count lsm_active_cnt)"
+          fi
 
           # __static_call_update is resolved by name but is NOT required: lsm_hook.c falls back to
           # the compiled-in macro and logs which path it took.  arm64 builds without
@@ -573,19 +622,15 @@ jobs:
             printf '  %-34s %s\n' "__static_call_update" "$n"
           fi
 
-          #     fget_raw and close_fd_get_file (susfs_opath.c) ARE listed: both are resolved by
-          #     name at runtime, so neither can appear in the .ko's undefined list and this loop
-          #     is the only place a variant's answer for them is recorded.  close_fd_get_file is
-          #     not exported at all, so a 0 here means the O_PATH layer cannot arm on that
-          #     variant.  fput is deliberately NOT here: it is EXPORT_SYMBOL'd and used as an
-          #     ordinary import, which the loader gate above and imports_guard.c already cover.
+          #     fget_raw (susfs_opath.c) IS listed: it is resolved by name at runtime, so it
+          #     cannot appear in the .ko's undefined list and this loop is the only place a
+          #     variant's answer is recorded.  fput is deliberately NOT here: it is
+          #     EXPORT_SYMBOL'd and used as an ordinary import, which the loader gate above and
+          #     imports_guard.c already cover.
           #
-          #     close_fd_get_file() and file_close_fd() are the old and the new name of the same
-          #     helper - and 6.1 changed the SIGNATURE without changing the name (int status plus
-          #     an out-param became the file itself).  The module picks its prototype from the
-          #     kernel it is built for, so which name must resolve differs per variant: the
-          #     expected counts are close_fd_get_file: 1 on 5.10/5.15/6.1/6.6 and 0 on 6.12/6.18,
-          #     with file_close_fd the other way round.
+          #     close_fd_get_file/file_close_fd are covered by the fd-table group above: from
+          #     6.1 the module tries close_fd_get_file first and file_close_fd second; before
+          #     6.1 only close_fd_get_file resolves.
           #     The two syscall tables are listed for the same reason: susfs_fp_hook resolves them
           #     by name, and a 0 for either is what would stop every table-entry layer at once
           #     (the tables themselves obviously exist - this is about the symbol being in
@@ -593,7 +638,7 @@ jobs:
           for s in copy_mnt_ns attach_recursive_mnt generic_shutdown_super seq_show \
                    __arm64_sys_statx do_statx put_mnt_ns d_path security_cred_getsecid \
                    fget_raw sys_call_table compat_sys_call_table \
-                   namespace_sem kallsyms_op modules_op kallsyms_lookup \
+                   namespace_sem kallsyms_op modules_op \
                    synchronize_rcu_tasks task_work_add put_unused_fd \
                    saved_boot_config init_mm copy_to_kernel_nofault __set_fixmap \
                    smaps_walk_ops smaps_shmem_walk_ops pagemap_ops; do
