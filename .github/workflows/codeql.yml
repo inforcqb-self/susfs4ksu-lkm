@@ -26,13 +26,21 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Built in the DDK container, one variant only: CodeQL needs one compile of the module, and 5.15
-  # (LLVM CFI) is the variant this device runs.
+  # Two builds.  5.15 is the variant the release device runs; 6.18 compiles every >= 6.12 path,
+  # including the 6.13/6.16/6.18 guards.  (6.12 shares the static-call implementation but not the
+  # later guards.)  Each compile uploads under its own CodeQL category, so the two databases do not
+  # replace each other.
   c-cpp:
-    name: Analyze (c-cpp)
+    name: Analyze (c-cpp, ${{ matrix.variant }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { variant: android13-5.15, image: "ghcr.io/ylarod/ddk-min:android13-5.15-20260828@sha256:9e68cd9fcab748584755d31ba88ef134efc938dbde17f258c2652315f6cd81cd" }
+          - { variant: android17-6.18, image: "ghcr.io/ylarod/ddk-min:android17-6.18-20260828@sha256:fb8b66200bf402cf65a751060fc1aa29524b9fa8840feef16c7b196a4f3f0e6e" }
     container:
-      image: ghcr.io/ylarod/ddk-min:android13-5.15-20260828
+      image: ${{ matrix.image }}
       options: --privileged
     permissions:
       security-events: write
@@ -61,7 +69,7 @@ jobs:
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
         with:
-          category: "/language:c-cpp"
+          category: "/language:c-cpp/${{ matrix.variant }}"
 
   python:
     name: Analyze (python)
