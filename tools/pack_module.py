@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Pack a flashable KernelSU module from a release's .ko set and susfs_insmod.
+"""Pack a flashable KernelSU module from a build's .ko set and susfs_insmod.
 
 Bundles the module scripts, every susfs_guard_lkm-<kmi>.ko found and the loader
 into one ZIP, with a generated kmis list, module.prop and provenance.json. The
@@ -27,6 +27,10 @@ def main():
     ap.add_argument("--insmod", required=True, help="path to the susfs_insmod binary")
     ap.add_argument("--tag", required=True, help="release tag, used as the module version")
     ap.add_argument("--out", required=True, help="output ZIP path")
+    ap.add_argument("--sha", default="", help="commit the module was built from")
+    ap.add_argument("--run-id", default="", help="build-lkm-ddk workflow run id")
+    ap.add_argument("--ddk-images", default="",
+                    help="file holding the JSON list of DDK image references (name@sha256:...)")
     args = ap.parse_args()
 
     ko_dir = Path(args.ko_dir)
@@ -55,9 +59,22 @@ def main():
         f"description=not loaded yet - loads the matching .ko on boot "
         f"({len(kmis)} arm64 KMIs, {low}-{high}). Loader only, no rules.\n"
     )
+    ddk_images = []
+    if args.ddk_images:
+        ddk_images = json.loads(Path(args.ddk_images).read_text())
+        if not isinstance(ddk_images, list):
+            raise SystemExit(f"ddk images file is not a JSON list: {args.ddk_images}")
+
     provenance = {
         "repository": "https://github.com/inforcqb/susfs4ksu-lkm",
         "tag": args.tag,
+        # The provenance has to say which source and which toolchain produced these
+        # bytes; the tag alone ties the ZIP to a name, not to a tree.  Both are
+        # recorded only when the caller supplies them (the host pack test does not).
+        "github_sha": args.sha or None,
+        "github_run_id": int(args.run_id) if args.run_id.isdigit() else None,
+        "build_workflow": ".github/workflows/build-ddk.yml",
+        "ddk_images": ddk_images,
         "architecture": "arm64",
         "supported_kmis": kmis,
         "assets_sha256": {p.name: sha256(p) for p in kos} | {insmod.name: sha256(insmod)},
