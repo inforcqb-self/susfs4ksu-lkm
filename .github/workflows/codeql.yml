@@ -25,6 +25,10 @@ on:
     - cron: '17 3 * * 1'
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Two builds.  5.15 is the variant the release device runs; 6.18 compiles every >= 6.12 path,
   # including the 6.13/6.16/6.18 guards.  (6.12 shares the static-call implementation but not the
@@ -33,6 +37,7 @@ jobs:
   c-cpp:
     name: Analyze (c-cpp, ${{ matrix.variant }})
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -74,6 +79,7 @@ jobs:
   python:
     name: Analyze (python)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       security-events: write
       actions: read
@@ -92,6 +98,7 @@ jobs:
   actions:
     name: Analyze (actions)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       security-events: write
       actions: read

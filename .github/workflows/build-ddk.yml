@@ -30,6 +30,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # One .ko per GKI (kernel version × Android release) combination that exists.  A module is NOT portable across these
   # (vermagic/KMI differ, and so do the LSM hook prototypes this module hooks by offset), so every combination the DDK
@@ -49,6 +53,7 @@ jobs:
     # `image` to the matrix entries changes the default job name and every PR stays BLOCKED.
     name: module (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       # Pinned by digest, not by the date tag: a tag is mutable, and for a project whose output is
@@ -710,6 +715,7 @@ jobs:
   # that reads the ABI wrong is how "verified" becomes wrong.
   tools:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     container:
       image: ghcr.io/ylarod/ddk-min:android14-6.1-20260828@sha256:1dd6ac340b627a90a4031d6d0df6b129d8cc949b139fb56032c898f023d3d5d3
       options: --privileged
@@ -729,12 +735,11 @@ jobs:
           ls -la /tmp/susfs_sc
 
       - name: Upload userspace client
-        continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
           name: susfs_sc
           path: /tmp/susfs_sc
-          if-no-files-found: warn
+          if-no-files-found: error
 
       # Micro-benchmark for the syscall layers (same freestanding shape as the client above), used to answer
       # "what does the hook cost per call".
@@ -747,12 +752,11 @@ jobs:
           ls -la /tmp/susfs_bench
 
       - name: Upload micro-benchmark
-        continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
           name: susfs_bench
           path: /tmp/susfs_bench
-          if-no-files-found: warn
+          if-no-files-found: error
 
       # Resolves this process's own /proc/self/map_files entries N times, as the uid it is started
       # with.  The map_files layer answers -ENOENT whether or not the reference the callee took is
@@ -767,12 +771,11 @@ jobs:
           ls -la /tmp/susfs_mapfile_probe
 
       - name: Upload map_files probe
-        continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
           name: susfs_mapfile_probe
           path: /tmp/susfs_mapfile_probe
-          if-no-files-found: warn
+          if-no-files-found: error
 
       # What an open handed back, asked the way a caller asks: the fd or the errno, F_GETFD
       # (FD_CLOEXEC), F_GETFL, fstat(fd) - which is EBADF if the number was taken out of the table
@@ -787,12 +790,11 @@ jobs:
           ls -la /tmp/susfs_open_probe
 
       - name: Upload open-result probe
-        continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
           name: susfs_open_probe
           path: /tmp/susfs_open_probe
-          if-no-files-found: warn
+          if-no-files-found: error
 
       # Scans a directory for the placeholder record a post-hoc dirent filter leaves behind: a
       # 56-byte getdents64 buffer forces one record per call, so a chunk whose only record is
@@ -807,12 +809,11 @@ jobs:
           ls -la /tmp/susfs_dirent_scan
 
       - name: Upload dirent-scan probe
-        continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
           name: susfs_dirent_scan
           path: /tmp/susfs_dirent_scan
-          if-no-files-found: warn
+          if-no-files-found: error
 
       # mmap a file, touch it, then read /proc/self/pagemap and /proc/self/smaps_rollup *in the same process* - a shell
       # cannot do this, because the child that runs dd has its own mm and therefore its own addresses.
@@ -825,12 +826,11 @@ jobs:
           ls -la /tmp/susfs_mmap
 
       - name: Upload mmap/pagemap probe
-        continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
           name: susfs_mmap
           path: /tmp/susfs_mmap
-          if-no-files-found: warn
+          if-no-files-found: error
 
       # The second door to a hidden mapping's content: /proc/self/mem and process_vm_readv(2), both read by the process
       # that owns the mapping - the only way to tell whether a remote-memory hook actually refuses.
@@ -843,12 +843,11 @@ jobs:
           ls -la /tmp/susfs_memrd
 
       - name: Upload remote-memory probe
-        continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
           name: susfs_memrd
           path: /tmp/susfs_memrd
-          if-no-files-found: warn
+          if-no-files-found: error
 
       # The detector's view of a hidden mount: the mnt_id that /proc/self/fdinfo/N prints and statx(2) returns, checked
       # against the ids mountinfo lists.
@@ -861,12 +860,11 @@ jobs:
           ls -la /tmp/susfs_mntid
 
       - name: Upload mnt_id cross-check
-        continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
           name: susfs_mntid
           path: /tmp/susfs_mntid
-          if-no-files-found: warn
+          if-no-files-found: error
 
       # A 32-bit client.  Only a real AArch32 caller can exercise the compat stat path, and the audit showed the module
       # had the compat structure wrong - no 64-bit test could have seen that.
@@ -880,12 +878,11 @@ jobs:
           ls -la /tmp/susfs_compat_stat
 
       - name: Upload 32-bit compat stat client
-        continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
           name: susfs_compat_stat
           path: /tmp/susfs_compat_stat
-          if-no-files-found: warn
+          if-no-files-found: error
 
       # A 64-bit client for the syscalls the shell cannot reach.  `ls -li` and toybox stat only
       # exercise newfstatat(79); fstat(80) and statx(291) fill a DIFFERENT struct (statx's is a
@@ -901,12 +898,11 @@ jobs:
           ls -la /tmp/susfs_stat
 
       - name: Upload 64-bit stat/statx/fstat client
-        continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
           name: susfs_stat
           path: /tmp/susfs_stat
-          if-no-files-found: warn
+          if-no-files-found: error
 
       # The loading half of this project: it loads the .ko on a stock vendor kernel WITHOUT ksud, by rewriting every
       # undefined symbol of the image to st_shndx=SHN_ABS / st_value=<kallsyms address> before init_module(2), so the
@@ -930,12 +926,11 @@ jobs:
           /tmp/insmod_match_test
 
       - name: Upload module loader
-        continue-on-error: true
         uses: actions/upload-artifact@v6
         with:
           name: susfs_insmod
           path: /tmp/susfs_insmod
-          if-no-files-found: warn
+          if-no-files-found: error
 
   # The flashable KernelSU module, packed from the artifacts of the run that just finished.
   #
@@ -946,6 +941,7 @@ jobs:
   module-zip:
     needs: [module, tools]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read

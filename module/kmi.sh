@@ -1,3 +1,4 @@
+#!/system/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 # Pick the packaged KMI for a kernel release string. The packaged set lives in
 # "$2/kmis" (one <android-os>-<kver> per line), so adding a KMI needs no edit here.

@@ -11,14 +11,21 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Shellcheck
+        run: shellcheck -x -S info -e SC1091,SC2015 module/*.sh
       - name: Shell syntax
         run: for s in module/*.sh; do sh -n "$s"; done
       - name: Byte-compile
