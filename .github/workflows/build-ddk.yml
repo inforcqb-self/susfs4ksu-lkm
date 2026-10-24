@@ -124,7 +124,7 @@ jobs:
 
           # Exactly the hooks this module installs (kernel/sus_path.c).  A missing one is a hard error: the module would
           # not compile against this tree, and a silently dropped hook would read as coverage in the counters.
-          HOOKS="inode_permission inode_getattr inode_unlink inode_rmdir inode_rename \
+          HOOKS="inode_permission inode_getattr inode_readlink inode_unlink inode_rmdir inode_rename \
                  inode_link sb_statfs inode_setattr inode_getxattr inode_listxattr \
                  inode_setxattr inode_removexattr path_notify"
           n=0
@@ -139,7 +139,7 @@ jobs:
           echo "checked $n hook prototypes"
 
           echo "=== the SELinux implementations we target by name ==="
-          for s in inode_permission inode_getattr inode_unlink inode_rmdir inode_rename \
+          for s in inode_permission inode_getattr inode_readlink inode_unlink inode_rmdir inode_rename \
                    inode_link sb_statfs inode_setattr inode_getxattr inode_listxattr \
                    inode_setxattr inode_removexattr path_notify; do
             echo "--- selinux_$s ---"
