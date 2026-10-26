@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: GPL-2.0-only
+name: module-main
+
+# Pack the flashable KernelSU module ZIP for every main build, as a workflow artifact.
+#
+# build-lkm-ddk already builds the .ko set on each push; module-zip.yml only packs them when a
+# release is published. This workflow fills the gap between tags: after a successful build-lkm-ddk
+# run on main it repacks that run's .ko set and susfs_insmod into the same ZIP (same packer and
+# provenance.json as the release one), versioned main-<short sha>, and uploads it as an artifact.
+# A commit on main is then installable without waiting for a tagged release.
+#
+# Note: workflow_run always runs the default branch's copy of this file, so it starts working only
+# once this is merged to main (it will not run from a pull request). Use the workflow_dispatch input
+# to package a specific build-lkm-ddk run id by hand.
+on:
+  workflow_run:
+    workflows: [build-lkm-ddk]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run-id:
+        description: build-lkm-ddk run id to package
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_sha || inputs.run-id }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    # Only a successful build on main (or a manual dispatch) has a usable .ko set to pack.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve the build run
+        id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run="${{ github.event.workflow_run.id || inputs.run-id }}"
+          sha=$(gh run view "$run" --repo "${{ github.repository }}" --json headSha --jq .headSha)
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:12}" >> "$GITHUB_OUTPUT"
+      # The module scripts, LICENSE and the DDK digest list come from the exact commit the build ran
+      # on, never from whatever is at the head of main, so a ZIP always matches its own .ko set.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.r.outputs.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Download the build artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ steps.r.outputs.run }}
+        run: |
+          set -euo pipefail
+          mkdir -p build assets
+          gh run download "$RUN" --repo "${{ github.repository }}" \
+            --pattern 'susfs_guard_lkm.ko-*' --dir build
+          gh run download "$RUN" --repo "${{ github.repository }}" \
+            --name susfs_insmod --dir build/loader
+          for d in build/susfs_guard_lkm.ko-*; do
+            kmi="${d#build/susfs_guard_lkm.ko-}"
+            cp "$d/susfs_guard_lkm.ko" "assets/susfs_guard_lkm-$kmi.ko"
+          done
+          cp build/loader/susfs_insmod assets/susfs_insmod
+          ls -l assets
+      - name: Collect the toolchain images
+        run: |
+          python - <<'EOF'
+          import json, pathlib, re
+          text = pathlib.Path(".github/workflows/build-ddk.yml").read_text()
+          images = sorted(set(re.findall(
+              r"ghcr\.io/ylarod/ddk-min:[^@\s]+@sha256:[0-9a-f]{64}", text)))
+          if len(images) != 8:
+              raise SystemExit(f"expected 8 digest-pinned DDK images, found {len(images)}")
+          pathlib.Path("ddk-images.json").write_text(json.dumps(images, indent=2) + "\n")
+          EOF
+      - name: Package module
+        env:
+          SHA: ${{ steps.r.outputs.sha }}
+          SHORT: ${{ steps.r.outputs.short }}
+          RUN: ${{ steps.r.outputs.run }}
+        run: |
+          set -euo pipefail
+          python tools/pack_module.py --ko-dir assets --insmod assets/susfs_insmod \
+            --tag "main-$SHORT" --sha "$SHA" --run-id "$RUN" --ddk-images ddk-images.json \
+            --out "dist/susfs_guard_lkm-module-main-$SHORT-arm64.zip"
+          ls -l dist
+      - name: Upload the module ZIP
+        uses: actions/upload-artifact@v6
+        with:
+          name: susfs_guard_lkm-module-main-${{ steps.r.outputs.short }}-arm64
+          path: dist/*.zip
+          retention-days: 30
