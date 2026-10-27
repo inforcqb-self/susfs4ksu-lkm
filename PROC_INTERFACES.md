@@ -20,6 +20,7 @@
 | [`/proc/susfs_hide_modules`](#procsusfs_hide_modules) | 按名字把**其它内核模块**从 `/proc/modules` 去掉 | `add <名字>` / `del <名字>` / `set <名字>…` / `clear` |
 | [`/proc/susfs_hide_mounts`](#procsusfs_hide_mounts) | 哪些挂载算"我们的"（决定隐藏的挂载集合） | `add <前缀>` / `del <前缀>` / `set <前缀>…` / `reset` / `clear` |
 | [`/proc/susfs_path`](#procsusfs_path) | sus_path 规则表——**`cat` 就是清单** | `add <路径>` / `del <路径>` / `clear` |
+| [`/proc/susfs_map`](#procsusfs_map) | 按 inode 隐藏 mmap 的 real file（`maps`/`smaps`/`smaps_rollup`/`map_files`/`pagemap`） | `add <路径>` / `del <路径>` / `clear` |
 | [`/proc/susfs_opath`](#procsusfs_opath) | `open(..., O_PATH)` 在隐藏路径上的覆盖自检 | —（只读；两个参数 `opath_test` / `opath_dump`） |
 
 节点只在 sus_path 的 LSM 层装上时才创建。
@@ -221,3 +222,24 @@ echo clear               > /proc/susfs_path     # 清掉所有**普通**规则
 ```sh
 ksu_susfs add_open_redirect <target> <redirected> <uid_scheme>   # uid_scheme: 0..4
 ```
+
+## /proc/susfs_map
+
+按 inode 把 mmap 的 real file 从 `/proc/<pid>/maps`、`smaps`、`smaps_rollup`、`map_files`、`pagemap` 里隐藏；与 reboot(2) supercall 的 `CMD_SUSFS_ADD_SUS_MAP` 是同一组规则。
+
+**读**：
+
+```text
+rules: 1/64
+ino=123456 dev=65099
+```
+
+**写**：
+
+```sh
+echo "add /system/lib64/libfoo.so" > /proc/susfs_map
+echo "del /system/lib64/libfoo.so" > /proc/susfs_map
+echo clear > /proc/susfs_map
+```
+
+`add` 解析路径（跟随符号链接）并登记 inode；`del` 解析同一路径后删除匹配项；`clear` 清空。写成功返回 `len`，失败返回负 errno。节点 0777；读写与其它控制节点走同一套 su 侧门控。`map_ino` 模块参数仍可在加载时登记一个 inode；该规则不保存 dev（dev=0），按 inode 匹配任意文件系统，`del <path>` 会命中第一条匹配项。
