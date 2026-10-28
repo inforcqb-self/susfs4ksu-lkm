@@ -685,7 +685,12 @@ static void kmsg_read_new(sysarg fd)
 	kbuf[kbuf_len] = 0;
 }
 
-static const char *const kmsg_interesting[] = {
+/* Do NOT make this an array of pointers.  This tool is a -nostdlib static PIE
+ * loaded by the kernel, and the kernel does not apply ELF RELATIVE relocations;
+ * an array of pointers therefore starts as eight NULLs and kmsg_report() faults
+ * on the first load failure - before it can read the kernel's vermagic message.
+ * A 2-D char array is addressed PC-relatively and has no relocations. */
+static const char kmsg_interesting[][32] = {
 	"Unknown symbol",
 	"version magic",
 	"does not import it",
