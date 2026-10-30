@@ -53,3 +53,27 @@ select_kmi() {
   [ "$n" = 1 ] && { echo "$match"; return 0; }
   return 1
 }
+
+# Last resort after manual override and automatic matching both fail: ask the
+# KernelSU daemon which KMI it booted.  The answer is accepted only when it is
+# one of the packaged KMIs and its .ko is present, so a stale/bogus ksud answer
+# cannot select an absent file.
+select_kmi_from_ksud() {
+  dir="$1"
+  ksud_bin=""
+  for candidate in ksud /data/adb/ksu/bin/ksud /data/adb/ksud; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      ksud_bin=$(command -v "$candidate")
+      break
+    fi
+  done
+  [ -n "$ksud_bin" ] || return 1
+
+  out=$("$ksud_bin" boot-info current-kmi 2>/dev/null) || return 1
+  kmi=$(printf '%s\n' "$out" | tr -d '\r' | sed -n '1p')
+  [ -n "$kmi" ] || return 1
+  case "$kmi" in android[0-9]*-[0-9]*) ;; *) return 1 ;; esac
+  grep -Fqx -- "$kmi" "$dir/kmis" >/dev/null 2>&1 || return 1
+  [ -s "$dir/lib/susfs_guard_lkm-$kmi.ko" ] || return 1
+  printf '%s\n' "$kmi"
+}

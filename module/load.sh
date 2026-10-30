@@ -47,16 +47,29 @@ else
   MODE=auto
 fi
 if [ "$MODE" = auto ]; then
-  [ "$REL" != unknown ] || {
-    echo "KMI detection failed: cannot read kernel release"
-    set_description "❌ KMI detection failed: cannot read kernel release"
-    exit 1
-  }
-  KMI=$(select_kmi "$REL" "$MODDIR") || {
-    echo "KMI detection failed: no packaged .ko for kernel: $REL"
-    set_description "❌ KMI detection failed: no packaged .ko for kernel $REL"
-    exit 1
-  }
+  if [ "$REL" != unknown ]; then
+    KMI=$(select_kmi "$REL" "$MODDIR") || KMI=""
+  fi
+  if [ -n "$KMI" ] && [ ! -s "$MODDIR/lib/susfs_guard_lkm-$KMI.ko" ]; then
+    echo "release matched $KMI but its .ko is missing; trying ksud boot-info current-kmi"
+    KMI=""
+  fi
+  if [ -z "$KMI" ]; then
+    # Manual override and release-string matching both failed.  Ask the KernelSU
+    # daemon for the KMI it booted; this is the last source before refusing.
+    if [ "$REL" = unknown ]; then
+      echo "kernel release unreadable; trying ksud boot-info current-kmi"
+    else
+      echo "no packaged KMI matched kernel $REL; trying ksud boot-info current-kmi"
+    fi
+    KMI=$(select_kmi_from_ksud "$MODDIR") || {
+      echo "KMI detection failed: no release match and ksud current-kmi unavailable or not packaged"
+      set_description "❌ KMI detection failed: no packaged .ko for kernel $REL"
+      exit 1
+    }
+    MODE=ksud
+    echo "ksud boot-info current-kmi: $KMI"
+  fi
 fi
 KO="$MODDIR/lib/susfs_guard_lkm-$KMI.ko"
 [ -s "$KO" ] || {
@@ -71,6 +84,8 @@ if [ "$rc" = 0 ]; then
   echo "loaded ($MODE)."
   if [ "$MODE" = custom ]; then
     set_description "✅ custom load ($KMI) | kernel $REL"
+  elif [ "$MODE" = ksud ]; then
+    set_description "✅ ksud-detected ($KMI) | kernel $REL"
   else
     set_description "✅ auto-detected ($KMI) | kernel $REL"
   fi
