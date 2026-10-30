@@ -179,6 +179,9 @@ static DEFINE_SPINLOCK(sus_path_lock);
 static DEFINE_MUTEX(sus_path_lifecycle_lock);
 static DECLARE_WAIT_QUEUE_HEAD(sus_path_release_wait);
 static unsigned int sus_path_count;
+/* Ordinary rules only (self_protect == false).  The create-family fast path must not treat the
+ * module's own hidden /proc nodes as operator policy. */
+static unsigned int sus_path_user_count;
 static bool sus_path_stopping;
 /* BTF-backed filesystem lifetime cleanup is optional on older GKI kernels. */
 static bool sus_path_lifetime_watch;
@@ -199,6 +202,8 @@ static void sus_path_retire_entry(struct sus_path_entry *e, struct list_head *do
 {
     list_move_tail(&e->list, doomed);
     sus_path_count--;
+    if (!e->self_protect && sus_path_user_count)
+        sus_path_user_count--;
     if (e->inode)
         list_add_tail(&e->retiring_list, &sus_path_retiring);
     else
@@ -1238,6 +1243,14 @@ bool sus_path_inode_hidden_public(struct inode *inode)
 bool sus_path_rules_present(void)
 {
     return READ_ONCE(sus_path_count) > 0;
+}
+
+/* The create-family fast path only cares about operator rules.  Self-protect entries keep the
+ * module's own /proc nodes invisible, but they must not turn every create syscall into a path
+ * lookup. */
+bool sus_path_user_rules_present(void)
+{
+    return READ_ONCE(sus_path_user_count) > 0;
 }
 
 static int sus_path_inode_getattr(const struct path *path)
@@ -2529,6 +2542,8 @@ static int sus_path_publish_entry(struct sus_path_entry *e, bool merge_pending)
     }
     list_add_tail(&e->list, &sus_path_list);
     sus_path_count++;
+    if (!e->self_protect)
+        sus_path_user_count++;
     if (e->inode)
         sus_path_relax_mode(e);
     else
