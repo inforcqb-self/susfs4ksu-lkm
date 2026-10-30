@@ -83,6 +83,7 @@ echo "kernel $REL -> $KMI ($MODE)"
 # not a reason to try another KMI.
 LOAD_TIMEOUT=60
 TIMEOUT_LOG=/data/adb/susfsload_timeout.log
+TIMEOUT_DMESG_LOG=/data/adb/susfsload_timeout_dmesg.log
 TIMEOUT_BIN=""
 for candidate in timeout /system/bin/timeout; do
   if command -v "$candidate" >/dev/null 2>&1; then
@@ -108,6 +109,19 @@ if [ "$rc" = 124 ]; then
     cat "$MODDIR/load.log"
   } > "$TIMEOUT_LOG" 2>&1
   chmod 0600 "$TIMEOUT_LOG" 2>/dev/null
+  {
+    echo "susfs_guard_lkm load timeout dmesg: $(date)"
+    echo "kernel: $REL"
+    echo "KMI: $KMI ($MODE)"
+    echo "limit: ${LOAD_TIMEOUT}s"
+    echo "--- dmesg ---"
+    if command -v dmesg >/dev/null 2>&1; then
+      dmesg 2>&1
+    else
+      echo "dmesg utility unavailable"
+    fi
+  } > "$TIMEOUT_DMESG_LOG" 2>&1
+  chmod 0600 "$TIMEOUT_DMESG_LOG" 2>/dev/null
   set_description "❌ load timed out (${KMI}) after ${LOAD_TIMEOUT}s | kernel $REL"
   exit 124
 fi
