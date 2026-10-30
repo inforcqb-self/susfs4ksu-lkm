@@ -368,8 +368,11 @@ void susfs_fp_drain(void)
 {
 	if (!fp_sync_looked_up) {
 		fp_sync_rcu_tasks_fn = (void *)find_kernel_symbol_exact("synchronize_rcu_tasks");
-		fp_sync_looked_up = true;
-		if (!fp_sync_rcu_tasks_fn)
+		/* Cache SUCCESS only - caching a failure keeps the 50 ms fallback forever, which is
+		 * what ksu_lsm_hook_drain() already says about its own copy of this. */
+		if (fp_sync_rcu_tasks_fn)
+			fp_sync_looked_up = true;
+		else
 			pr_warn("susfs_fp: synchronize_rcu_tasks not found, using a delay\n");
 	}
 
