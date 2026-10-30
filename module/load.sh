@@ -91,7 +91,29 @@ for candidate in timeout /system/bin/timeout; do
     break
   fi
 done
+# Start the kernel log follower before the loader, so the dmesg file contains the whole
+# load attempt rather than only the lines that happened to remain when it timed out.
+DMESG_PID=""
+dmesg_stop() {
+  if [ -n "$DMESG_PID" ]; then
+    kill "$DMESG_PID" 2>/dev/null
+    wait "$DMESG_PID" 2>/dev/null
+    DMESG_PID=""
+  fi
+}
+dmesg_start() {
+  {
+    echo "susfs_guard_lkm load dmesg: $(date)"
+    echo "kernel: $REL"
+    echo "KMI: $KMI ($MODE)"
+    echo "limit: ${LOAD_TIMEOUT}s"
+    echo "--- dmesg from load start ---"
+    exec dmesg -W
+  } > "$TIMEOUT_DMESG_LOG" 2>&1 &
+  DMESG_PID=$!
+}
 if [ -n "$TIMEOUT_BIN" ]; then
+  dmesg_start
   "$TIMEOUT_BIN" "$LOAD_TIMEOUT" "$MODDIR/bin/susfs_insmod" "$KO" expose_proc=1
   rc=$?
 else
@@ -100,6 +122,9 @@ else
 fi
 if [ "$rc" = 124 ]; then
   echo "load timed out after ${LOAD_TIMEOUT}s"
+  dmesg_stop
+  echo "--- load timed out after ${LOAD_TIMEOUT}s ---" >> "$TIMEOUT_DMESG_LOG" 2>/dev/null
+  chmod 0600 "$TIMEOUT_DMESG_LOG" 2>/dev/null
   {
     echo "susfs_guard_lkm load timeout: $(date)"
     echo "kernel: $REL"
@@ -109,22 +134,11 @@ if [ "$rc" = 124 ]; then
     cat "$MODDIR/load.log"
   } > "$TIMEOUT_LOG" 2>&1
   chmod 0600 "$TIMEOUT_LOG" 2>/dev/null
-  {
-    echo "susfs_guard_lkm load timeout dmesg: $(date)"
-    echo "kernel: $REL"
-    echo "KMI: $KMI ($MODE)"
-    echo "limit: ${LOAD_TIMEOUT}s"
-    echo "--- dmesg ---"
-    if command -v dmesg >/dev/null 2>&1; then
-      dmesg 2>&1
-    else
-      echo "dmesg utility unavailable"
-    fi
-  } > "$TIMEOUT_DMESG_LOG" 2>&1
-  chmod 0600 "$TIMEOUT_DMESG_LOG" 2>/dev/null
   set_description "❌ load timed out (${KMI}) after ${LOAD_TIMEOUT}s | kernel $REL"
   exit 124
 fi
+dmesg_stop
+rm -f "$TIMEOUT_DMESG_LOG"
 if [ "$rc" = 0 ]; then
   echo "loaded ($MODE)."
   if [ "$MODE" = custom ]; then
