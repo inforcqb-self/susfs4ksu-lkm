@@ -78,8 +78,39 @@ KO="$MODDIR/lib/susfs_guard_lkm-$KMI.ko"
   exit 1
 }
 echo "kernel $REL -> $KMI ($MODE)"
-"$MODDIR/bin/susfs_insmod" "$KO" expose_proc=1
-rc=$?
+# One minute is the whole userspace load budget: the loader maps/relocates the .ko and then
+# blocks in init_module(2) while the kernel runs module_init().  A timeout is a failed load,
+# not a reason to try another KMI.
+LOAD_TIMEOUT=60
+TIMEOUT_LOG=/data/adb/susfsload_timeout.log
+TIMEOUT_BIN=""
+for candidate in timeout /system/bin/timeout; do
+  if command -v "$candidate" >/dev/null 2>&1; then
+    TIMEOUT_BIN=$(command -v "$candidate")
+    break
+  fi
+done
+if [ -n "$TIMEOUT_BIN" ]; then
+  "$TIMEOUT_BIN" "$LOAD_TIMEOUT" "$MODDIR/bin/susfs_insmod" "$KO" expose_proc=1
+  rc=$?
+else
+  echo "load failed: no timeout utility for the ${LOAD_TIMEOUT}s module_init limit"
+  rc=1
+fi
+if [ "$rc" = 124 ]; then
+  echo "load timed out after ${LOAD_TIMEOUT}s"
+  {
+    echo "susfs_guard_lkm load timeout: $(date)"
+    echo "kernel: $REL"
+    echo "KMI: $KMI ($MODE)"
+    echo "limit: ${LOAD_TIMEOUT}s"
+    echo "--- load.log ---"
+    cat "$MODDIR/load.log"
+  } > "$TIMEOUT_LOG" 2>&1
+  chmod 0600 "$TIMEOUT_LOG" 2>/dev/null
+  set_description "❌ load timed out (${KMI}) after ${LOAD_TIMEOUT}s | kernel $REL"
+  exit 124
+fi
 if [ "$rc" = 0 ]; then
   echo "loaded ($MODE)."
   if [ "$MODE" = custom ]; then
