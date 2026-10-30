@@ -703,20 +703,38 @@ static void sus_map_put_work_fn(struct callback_head *cb)
 
 	path_put(&w->path);
 	kfree(w);
+	/* Pairs with the try_module_get() in sus_map_path_put_soon(). */
+	module_put(THIS_MODULE);
 }
 
-/* 0 when the release has been queued, -errno when it has not. */
+/* 0 when the release has been queued, -errno when it has not.
+ *
+ * The callback runs from THIS MODULE's text, when the task next returns to userspace - which
+ * can be after `rmmod` has already freed it.  unregister_kretprobe() stops new calls but
+ * cannot cancel a task_work that is already queued, and the susfs_fp_drain() in
+ * susfs_sus_map_exit() does not cover one either: synchronize_rcu_tasks() counts a task that
+ * made a voluntary context switch as quiescent, and such a task has NOT returned to userspace
+ * yet, so its TWA_RESUME work has not run.  So the module is pinned until the callback has -
+ * the same reason, and the same pair of calls, as the supercall payload in susfs_supercall.c.
+ * A failed pin is reported like any other failure to queue: the caller then leaves the
+ * kernel's own answer, which is visible but not a leak. */
 static int sus_map_path_put_soon(const struct path *p)
 {
 	struct sus_map_put_work *w;
 
+	if (!try_module_get(THIS_MODULE))
+		return -ENODEV;
+
 	w = kmalloc(sizeof(*w), GFP_ATOMIC);
-	if (!w)
+	if (!w) {
+		module_put(THIS_MODULE);
 		return -ENOMEM;
+	}
 	w->path = *p;
 	init_task_work(&w->cb, sus_map_put_work_fn);
 	if (task_work_add(current, &w->cb, TWA_RESUME)) {
 		kfree(w);
+		module_put(THIS_MODULE);
 		return -EIO;
 	}
 	return 0;
