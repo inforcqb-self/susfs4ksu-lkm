@@ -991,5 +991,4 @@ void susfs_hide_syms_exit(void)
 		orig_m_show = NULL;
 		modules_op_target = NULL;
 	}
-	modules_op_target = NULL;
 }
