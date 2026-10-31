@@ -86,22 +86,55 @@ static susfs_syscall_fn_t create_orig_compat_mkdirat;
 static susfs_syscall_fn_t create_orig_compat_symlinkat;
 static susfs_syscall_fn_t create_orig_compat_linkat;
 
-/* Is this (dfd, path) a name sus_path hides from the current caller?  No
- * LOOKUP_FOLLOW: the last component is what the create would make, so a hidden
- * symlink must answer for the link itself, not for its target.
- *
- * __nocfi noinline: the calls through the resolved pointers are indirect calls
- * into the kernel, and the CFI call-site gate the build enforces
- * (tools/cfi_sites.py) refuses an instrumented call site. */
-static __nocfi noinline bool create_name_hidden(int dfd, const char __user *path)
+/* Diagnostic build only: show which create calls reach the layer and whether they take
+ * the user-rule lookup.  Remove before merging. */
+static atomic64_t create_dbg_calls = ATOMIC64_INIT(0);
+static atomic64_t create_dbg_fast = ATOMIC64_INIT(0);
+static atomic64_t create_dbg_slow = ATOMIC64_INIT(0);
+static atomic64_t create_dbg_hidden = ATOMIC64_INIT(0);
+static atomic_t create_dbg_fast_lines = ATOMIC_INIT(0);
+static atomic_t create_dbg_slow_lines = ATOMIC_INIT(0);
+
+static void create_dbg_path(const char __user *path, char *buf, size_t buflen)
+{
+	long n;
+
+	if (!path) {
+		strscpy(buf, "<null>", buflen);
+		return;
+	}
+	n = strncpy_from_user(buf, path, buflen - 1);
+	if (n < 0)
+		strscpy(buf, "<fault>", buflen);
+	else
+		buf[n] = '\0';
+}
+
+static __nocfi noinline bool create_name_hidden(const char *op, int dfd,
+						const char __user *path)
 {
 	struct filename *name;
 	struct path p;
 	bool hidden;
+	bool user;
+	char dbg_path[160];
 	int rc;
 
-	if (!sus_path_user_rules_present())
+	atomic64_inc(&create_dbg_calls);
+	user = sus_path_user_rules_present();
+	create_dbg_path(path, dbg_path, sizeof(dbg_path));
+	if (!user) {
+		atomic64_inc(&create_dbg_fast);
+		if (atomic_inc_return(&create_dbg_fast_lines) <= 40)
+			pr_info("create_gate: FAST %s dfd=%d path=\"%s\" comm=%s pid=%d\n",
+				op, dfd, dbg_path, current->comm, current->pid);
 		return false;
+	}
+
+	atomic64_inc(&create_dbg_slow);
+	if (atomic_inc_return(&create_dbg_slow_lines) <= 120)
+		pr_info("create_gate: SLOW %s dfd=%d path=\"%s\" comm=%s pid=%d\n",
+			op, dfd, dbg_path, current->comm, current->pid);
 	if (!create_getname_fn || !create_filename_lookup_fn || !create_putname_fn)
 		return false;
 
@@ -117,8 +150,11 @@ static __nocfi noinline bool create_name_hidden(int dfd, const char __user *path
 #else
 	create_putname_fn(name);
 #endif
-	if (rc)
+	if (rc) {
+		if (atomic_read(&create_dbg_slow_lines) <= 120)
+			pr_info("create_gate: LOOKUP %s path=\"%s\" rc=%d\n", op, dbg_path, rc);
 		return false;		/* absent: the kernel's own answer */
+	}
 
 	hidden = sus_path_inode_hidden_public(d_inode(p.dentry));
 	if (hidden) {
@@ -128,6 +164,10 @@ static __nocfi noinline bool create_name_hidden(int dfd, const char __user *path
 		 * side of the differential, not the errno. */
 		struct inode *dir = d_inode(p.dentry->d_parent);
 
+		atomic64_inc(&create_dbg_hidden);
+		if (atomic_read(&create_dbg_slow_lines) <= 120)
+			pr_info("create_gate: HIDDEN %s path=\"%s\" comm=%s pid=%d\n",
+				op, dbg_path, current->comm, current->pid);
 		if (dir)
 			(void)susfs_create_inode_permission(dir, MAY_WRITE | MAY_EXEC);
 	}
@@ -141,7 +181,7 @@ static __nocfi noinline long create_wrap_mkdirat(const struct pt_regs *regs)
 
 	if (!orig)
 		return -ENOSYS;
-	if (create_name_hidden((int)regs->regs[0], (const char __user *)regs->regs[1]))
+	if (create_name_hidden("mkdirat", (int)regs->regs[0], (const char __user *)regs->regs[1]))
 		return -EACCES;
 	return orig(regs);
 }
@@ -152,7 +192,7 @@ static __nocfi noinline long create_wrap_mknodat(const struct pt_regs *regs)
 
 	if (!orig)
 		return -ENOSYS;
-	if (create_name_hidden((int)regs->regs[0], (const char __user *)regs->regs[1]))
+	if (create_name_hidden("mknodat", (int)regs->regs[0], (const char __user *)regs->regs[1]))
 		return -EACCES;
 	return orig(regs);
 }
@@ -164,7 +204,7 @@ static __nocfi noinline long create_wrap_symlinkat(const struct pt_regs *regs)
 
 	if (!orig)
 		return -ENOSYS;
-	if (create_name_hidden((int)regs->regs[1], (const char __user *)regs->regs[2]))
+	if (create_name_hidden("symlinkat", (int)regs->regs[1], (const char __user *)regs->regs[2]))
 		return -EACCES;
 	return orig(regs);
 }
@@ -178,9 +218,9 @@ static __nocfi noinline long create_wrap_linkat(const struct pt_regs *regs)
 
 	if (!orig)
 		return -ENOSYS;
-	if (create_name_hidden((int)regs->regs[0], (const char __user *)regs->regs[1]))
+	if (create_name_hidden("linkat old", (int)regs->regs[0], (const char __user *)regs->regs[1]))
 		return -ENOENT;
-	if (create_name_hidden((int)regs->regs[2], (const char __user *)regs->regs[3]))
+	if (create_name_hidden("linkat new", (int)regs->regs[2], (const char __user *)regs->regs[3]))
 		return -EACCES;
 	return orig(regs);
 }
@@ -191,7 +231,7 @@ static __nocfi noinline long create_wrap_compat_mkdirat(const struct pt_regs *re
 
 	if (!orig)
 		return -ENOSYS;
-	if (create_name_hidden((int)regs->regs[0], (const char __user *)regs->regs[1]))
+	if (create_name_hidden("compat/mkdirat", (int)regs->regs[0], (const char __user *)regs->regs[1]))
 		return -EACCES;
 	return orig(regs);
 }
@@ -202,7 +242,7 @@ static __nocfi noinline long create_wrap_compat_mknodat(const struct pt_regs *re
 
 	if (!orig)
 		return -ENOSYS;
-	if (create_name_hidden((int)regs->regs[0], (const char __user *)regs->regs[1]))
+	if (create_name_hidden("compat/mknodat", (int)regs->regs[0], (const char __user *)regs->regs[1]))
 		return -EACCES;
 	return orig(regs);
 }
@@ -213,7 +253,7 @@ static __nocfi noinline long create_wrap_compat_symlinkat(const struct pt_regs *
 
 	if (!orig)
 		return -ENOSYS;
-	if (create_name_hidden((int)regs->regs[1], (const char __user *)regs->regs[2]))
+	if (create_name_hidden("compat/symlinkat", (int)regs->regs[1], (const char __user *)regs->regs[2]))
 		return -EACCES;
 	return orig(regs);
 }
@@ -224,9 +264,9 @@ static __nocfi noinline long create_wrap_compat_linkat(const struct pt_regs *reg
 
 	if (!orig)
 		return -ENOSYS;
-	if (create_name_hidden((int)regs->regs[0], (const char __user *)regs->regs[1]))
+	if (create_name_hidden("compat/linkat old", (int)regs->regs[0], (const char __user *)regs->regs[1]))
 		return -ENOENT;
-	if (create_name_hidden((int)regs->regs[2], (const char __user *)regs->regs[3]))
+	if (create_name_hidden("compat/linkat new", (int)regs->regs[2], (const char __user *)regs->regs[3]))
 		return -EACCES;
 	return orig(regs);
 }
@@ -307,4 +347,9 @@ void susfs_create_gate_exit(void)
 	}
 	if (armed)
 		susfs_fp_drain();
+	SUSFS_LOGI("create_gate: debug counters calls=%lld fast=%lld slow=%lld hidden=%lld\n",
+		   (long long)atomic64_read(&create_dbg_calls),
+		   (long long)atomic64_read(&create_dbg_fast),
+		   (long long)atomic64_read(&create_dbg_slow),
+		   (long long)atomic64_read(&create_dbg_hidden));
 }
