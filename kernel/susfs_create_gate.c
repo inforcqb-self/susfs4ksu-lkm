@@ -264,6 +264,14 @@ int susfs_create_gate_init(void)
 		return -ENOENT;
 	}
 
+	/* With no operator rule there is nothing for this layer to answer.  Leave the
+	 * create syscalls untouched instead of installing wrappers that would run on every
+	 * mkdirat/mknodat/symlinkat/linkat and only take the fast pass. */
+	if (!sus_path_user_rules_present()) {
+		SUSFS_LOGI("create_gate: no user rules - not arming the create family\n");
+		return 0;
+	}
+
 	/* Unconditional: a supercall can add a rule before/after this layer, so the
 	 * entries must be there whenever the module is.  An entry that cannot be
 	 * installed leaves the others working and the kernel's own answer in place. */
