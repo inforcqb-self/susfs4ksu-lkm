@@ -165,6 +165,7 @@ enum susfs_feature {
 	SUSFS_FEAT_OPEN_REDIRECT,
 	SUSFS_FEAT_SUS_MAP,
 	SUSFS_FEAT_AVC_SPOOF,	/* commands only: no upstream CONFIG_* line for it */
+	SUSFS_FEAT_PRIORITY_FILTER,
 	SUSFS_FEAT_COUNT,
 };
 
@@ -181,6 +182,10 @@ void sus_path_supercall(unsigned int cmd, void __user **arg);
 void susfs_kstat_supercall(unsigned int cmd, void __user **arg);
 void susfs_open_redirect_supercall(void __user **arg);
 void susfs_sus_mount_supercall(void __user **arg);
+void susfs_priority_filter_supercall(void __user **arg);
+
+int susfs_priority_filter_init(void);
+void susfs_priority_filter_exit(void);
 
 int susfs_hide_syms_init(void);
 void susfs_hide_syms_exit(void);

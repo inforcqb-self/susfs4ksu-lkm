@@ -195,6 +195,9 @@ static void susfs_tw_func(struct callback_head *cb)
 	case CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS:
 		susfs_sus_mount_supercall(&arg);
 		break;
+	case CMD_SUSFS_SET_PRIORITY_UID_FILTER:
+		susfs_priority_filter_supercall(&arg);
+		break;
 	default:
 		/* Unreachable: reboot_pre() only defers a command susfs_cmd_handled()
 		 * accepted.  Kept as a net in case the two lists drift apart. */
@@ -248,6 +251,8 @@ static int susfs_cmd_feature(unsigned int cmd)
 		return SUSFS_FEAT_OPEN_REDIRECT;
 	case CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS:
 		return SUSFS_FEAT_SUS_MOUNT;
+	case CMD_SUSFS_SET_PRIORITY_UID_FILTER:
+		return SUSFS_FEAT_PRIORITY_FILTER;
 	default:
 		return -1;
 	}
@@ -460,6 +465,9 @@ static void __init susfs_abi_layout_check(void)
 
 	BUILD_BUG_ON(sizeof(struct st_susfs_enabled_features) != 8196);
 	BUILD_BUG_ON(offsetof(struct st_susfs_enabled_features, err) != 8192);
+
+	BUILD_BUG_ON(sizeof(struct st_susfs_priority_uid_filter) != 65540);
+	BUILD_BUG_ON(offsetof(struct st_susfs_priority_uid_filter, err) != 65536);
 }
 
 int susfs_supercall_init(void)

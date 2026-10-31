@@ -261,6 +261,7 @@ enum susfs_layer_id {
     SUSFS_L_OPEN_REDIRECT,
     SUSFS_L_ENABLE_LOG,
     SUSFS_L_AVC_SPOOF,
+    SUSFS_L_PRIORITY_FILTER,
     SUSFS_L_SUPERCALL,
     SUSFS_L_HIDE_SYMS,
     SUSFS_L_COUNT,
@@ -314,6 +315,10 @@ static struct susfs_layer {
     { "open_redirect",	susfs_open_redirect_init,	susfs_open_redirect_exit, false, SUSFS_FEAT_OPEN_REDIRECT },
     { "enable_log",	susfs_enable_log_init,		susfs_enable_log_exit,	false, SUSFS_FEAT_ENABLE_LOG },
     { "avc_spoof",	susfs_avc_spoof_init,		susfs_avc_spoof_exit,	false, SUSFS_FEAT_AVC_SPOOF },
+    /* NOT fatal, and after the other feature layers but before supercall so the feature is
+     * armed before a reboot(2) command for it can be accepted.  A failure here (no landing pad
+     * on a pKVM table, say) leaves the priority syscalls answering the kernel's own way. */
+    { "priority_filter", susfs_priority_filter_init,	susfs_priority_filter_exit, false, SUSFS_FEAT_PRIORITY_FILTER },
     { "supercall",	susfs_supercall_init,		susfs_supercall_exit,	false, -1 },
     { "hide_syms",	susfs_hide_syms_init,		susfs_hide_syms_exit,	false, SUSFS_FEAT_HIDE_SYMS },
 };
@@ -327,7 +332,8 @@ static struct susfs_layer {
  * comments in sync whenever a layer is inserted):
  *   1 fp_hook   2 ksu_umount_gate  3 ksu_allow_gate  4 lsm_hook   5 sus_path
  *   6 create_gate  7 opath  8 dirent  9 uname  10 kstat  11 sus_map  12 sus_mount
- *   13 cmdline  14 open_redirect  15 enable_log  16 avc_spoof  17 supercall  18 hide_syms
+ *   13 cmdline  14 open_redirect  15 enable_log  16 avc_spoof  17 priority_filter
+ *   18 supercall  19 hide_syms
  */
 static int fail_layer;
 module_param_named(fail_layer, fail_layer, int, 0644);
@@ -371,6 +377,7 @@ static const struct {
     { SUSFS_L_OPEN_REDIRECT, false },
     { SUSFS_L_ENABLE_LOG, false },
     { SUSFS_L_AVC_SPOOF, false },
+    { SUSFS_L_PRIORITY_FILTER, false },
     { SUSFS_L_SUPERCALL, true },
     { SUSFS_L_HIDE_SYMS, false },
 };

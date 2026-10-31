@@ -304,44 +304,57 @@ int susfs_fp_install(struct susfs_fp_hook *h)
 	return 0;
 }
 
-void susfs_fp_remove(struct susfs_fp_hook *h)
+int susfs_fp_remove(struct susfs_fp_hook *h)
 {
+	bool native_ours;
+	bool ok = true;
 	int cnr, err;
 
 	if (!h->installed || !sys_call_table_ptr)
-		return;
+		return 0;
 
 	cnr = fp_compat_nr(h);
 
-	if (h->nr >= 0 && READ_ONCE(sys_call_table_ptr[h->nr]) != h->wrapper) {
+	/* Each table is answered for on its own.  An entry somebody else has taken over must be
+	 * left alone - but that says nothing about the OTHER table, and returning here left a
+	 * compat entry still pointing at this module's wrapper across the unload, i.e. a 32-bit
+	 * caller's syscall into freed text.  Every hook with both an nr and an nr_compat is
+	 * exposed to it (the create family: mkdirat/mknodat/symlinkat/linkat). */
+	native_ours = h->nr < 0 || READ_ONCE(sys_call_table_ptr[h->nr]) == h->wrapper;
+	if (!native_ours)
 		pr_warn("susfs_fp: nr %d is not ours any more, leaving it alone\n", h->nr);
-		h->installed = false;
-		return;
-	}
 
 	if (cnr >= 0 && compat_sys_call_table_ptr && h->orig_compat &&
 	    READ_ONCE(compat_sys_call_table_ptr[cnr]) == h->wrapper) {
 		err = ksu_patch_text(&compat_sys_call_table_ptr[cnr], &h->orig_compat,
 				     sizeof(h->orig_compat), KSU_PATCH_TEXT_FLUSH_DCACHE);
-		if (err)
+		if (err) {
+			ok = false;
 			pr_warn("susfs_fp: %s: compat entry %d restore failed %d\n",
 				h->name, cnr, err);
-		else
+		} else
 			pr_info("susfs_fp: %s: compat entry %d restored\n", h->name, cnr);
 	}
 
 	/* nr < 0 means there is no native entry: only the compat one above was ours. */
-	if (h->nr >= 0) {
+	if (native_ours && h->nr >= 0) {
 		err = ksu_patch_text(&sys_call_table_ptr[h->nr], &h->orig,
 				     sizeof(h->orig), KSU_PATCH_TEXT_FLUSH_DCACHE);
-		if (err)
+		if (err) {
+			ok = false;
 			pr_warn("susfs_fp: nr %d restore failed %d\n", h->nr, err);
-		else
+		} else
 			pr_info("susfs_fp: nr %d (%s) disarmed, entry %px restored\n",
 				h->nr, h->name, (void *)h->orig);
 	}
 
+	if (!ok) {
+		pr_err("susfs_fp: %s remains installed after restore failure; module text must not be freed\n",
+			h->name);
+		return -EIO;
+	}
 	h->installed = false;
+	return 0;
 }
 
 /* Wait until nothing can be inside a wrapper before the module text goes away.
@@ -364,8 +377,11 @@ void susfs_fp_drain(void)
 {
 	if (!fp_sync_looked_up) {
 		fp_sync_rcu_tasks_fn = (void *)find_kernel_symbol_exact("synchronize_rcu_tasks");
-		fp_sync_looked_up = true;
-		if (!fp_sync_rcu_tasks_fn)
+		/* Cache SUCCESS only - caching a failure keeps the 50 ms fallback forever, which is
+		 * what ksu_lsm_hook_drain() already says about its own copy of this. */
+		if (fp_sync_rcu_tasks_fn)
+			fp_sync_looked_up = true;
+		else
 			pr_warn("susfs_fp: synchronize_rcu_tasks not found, using a delay\n");
 	}
 
