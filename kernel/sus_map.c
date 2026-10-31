@@ -54,6 +54,7 @@ static susfs_show_fn_t sus_map_orig_show;
 static susfs_show_fn_t sus_map_orig_smap;
 static bool sus_map_show_armed;
 static bool sus_map_smap_armed;
+static atomic_t sus_map_show_inflight = ATOMIC_INIT(0);
 
 
 /* Serialises rule PUBLICATION only; the reader stays lock-free: a slot is published by
@@ -278,22 +279,40 @@ static int sus_map_skip_vma_pre(struct kprobe *kp, struct pt_regs *regs)
  * wrapper and rewinding seq_file->count keeps the landing pad intact. */
 static int __nocfi sus_map_show_map_wrap(struct seq_file *m, void *v)
 {
-	if (!m || !sus_map_orig_show)
-		return -EINVAL;
+	int ret;
+
+	atomic_inc(&sus_map_show_inflight);
+	if (!m || !READ_ONCE(sus_map_orig_show)) {
+		ret = -EINVAL;
+		goto out;
+	}
 	/* Decide before running the original, so a hidden vma costs no more than the
 	 * probe version that skipped the body (no timing fingerprint). */
 	if (sus_map_hide_vma((struct vm_area_struct *)v, "show_map"))
-		return 0;
-	return sus_map_orig_show(m, v);
+		ret = 0;
+	else
+		ret = READ_ONCE(sus_map_orig_show)(m, v);
+out:
+	atomic_dec(&sus_map_show_inflight);
+	return ret;
 }
 
 static int __nocfi sus_map_show_smap_wrap(struct seq_file *m, void *v)
 {
-	if (!m || !sus_map_orig_smap)
-		return -EINVAL;
+	int ret;
+
+	atomic_inc(&sus_map_show_inflight);
+	if (!m || !READ_ONCE(sus_map_orig_smap)) {
+		ret = -EINVAL;
+		goto out;
+	}
 	if (sus_map_hide_vma((struct vm_area_struct *)v, "show_smap"))
-		return 0;
-	return sus_map_orig_smap(m, v);
+		ret = 0;
+	else
+		ret = READ_ONCE(sus_map_orig_smap)(m, v);
+out:
+	atomic_dec(&sus_map_show_inflight);
+	return ret;
 }
 
 static struct kprobe kp_map = {
@@ -1230,28 +1249,44 @@ void susfs_sus_map_exit(void)
     if (sus_map_show_armed) {
         susfs_show_fn_t orig = sus_map_orig_show;
 
-        if (!sus_map_maps_op || !orig ||
-            ksu_patch_text((void *)&sus_map_maps_op->show, &orig, sizeof(orig),
-                           KSU_PATCH_TEXT_FLUSH_DCACHE))
+        if (!sus_map_maps_op || !orig) {
             pr_warn("sus_map: show_map restore failed\n");
-        sus_map_show_armed = false;
+        } else if (READ_ONCE(sus_map_maps_op->show) != sus_map_show_map_wrap) {
+            sus_map_show_armed = false;
+        } else if (!ksu_patch_text((void *)&sus_map_maps_op->show, &orig,
+                                   sizeof(orig), KSU_PATCH_TEXT_FLUSH_DCACHE)) {
+            sus_map_show_armed = false;
+        } else {
+            pr_err("sus_map: show_map restore failed; wrapper remains installed\n");
+        }
     }
     if (sus_map_smap_armed) {
         susfs_show_fn_t orig = sus_map_orig_smap;
 
-        if (!sus_map_smaps_op || !orig ||
-            ksu_patch_text((void *)&sus_map_smaps_op->show, &orig, sizeof(orig),
-                           KSU_PATCH_TEXT_FLUSH_DCACHE))
+        if (!sus_map_smaps_op || !orig) {
             pr_warn("sus_map: show_smap restore failed\n");
-        sus_map_smap_armed = false;
+        } else if (READ_ONCE(sus_map_smaps_op->show) != sus_map_show_smap_wrap) {
+            sus_map_smap_armed = false;
+        } else if (!ksu_patch_text((void *)&sus_map_smaps_op->show, &orig,
+                                   sizeof(orig), KSU_PATCH_TEXT_FLUSH_DCACHE)) {
+            sus_map_smap_armed = false;
+        } else {
+            pr_err("sus_map: show_smap restore failed; wrapper remains installed\n");
+        }
     }
     /* A caller can still be inside a wrapper after its entry is restored: wait
      * for it before the module text may go away. */
     susfs_fp_drain();
-    sus_map_maps_op = NULL;
-    sus_map_smaps_op = NULL;
-    sus_map_orig_show = NULL;
-    sus_map_orig_smap = NULL;
+    while (atomic_read(&sus_map_show_inflight))
+        cpu_relax();
+    if (!sus_map_show_armed) {
+        sus_map_maps_op = NULL;
+        sus_map_orig_show = NULL;
+    }
+    if (!sus_map_smap_armed) {
+        sus_map_smaps_op = NULL;
+        sus_map_orig_smap = NULL;
+    }
     map_registered = false;
     mutex_unlock(&map_ctl_lock);
 
