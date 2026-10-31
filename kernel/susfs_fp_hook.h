@@ -57,7 +57,8 @@ unsigned long susfs_fp_syscall_table(void);
 unsigned long susfs_fp_compat_syscall_table(void);
 
 int susfs_fp_install(struct susfs_fp_hook *h);
-void susfs_fp_remove(struct susfs_fp_hook *h);
+/* Returns 0 only when every owned entry is restored or was already taken over. */
+int susfs_fp_remove(struct susfs_fp_hook *h);
 
 /* Blocks until no CPU can still be inside a wrapper; call before the module text
  * may go away (i.e. once, after all entries are restored). */

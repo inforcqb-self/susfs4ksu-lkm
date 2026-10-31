@@ -304,13 +304,14 @@ int susfs_fp_install(struct susfs_fp_hook *h)
 	return 0;
 }
 
-void susfs_fp_remove(struct susfs_fp_hook *h)
+int susfs_fp_remove(struct susfs_fp_hook *h)
 {
 	bool native_ours;
+	bool ok = true;
 	int cnr, err;
 
 	if (!h->installed || !sys_call_table_ptr)
-		return;
+		return 0;
 
 	cnr = fp_compat_nr(h);
 
@@ -327,10 +328,11 @@ void susfs_fp_remove(struct susfs_fp_hook *h)
 	    READ_ONCE(compat_sys_call_table_ptr[cnr]) == h->wrapper) {
 		err = ksu_patch_text(&compat_sys_call_table_ptr[cnr], &h->orig_compat,
 				     sizeof(h->orig_compat), KSU_PATCH_TEXT_FLUSH_DCACHE);
-		if (err)
+		if (err) {
+			ok = false;
 			pr_warn("susfs_fp: %s: compat entry %d restore failed %d\n",
 				h->name, cnr, err);
-		else
+		} else
 			pr_info("susfs_fp: %s: compat entry %d restored\n", h->name, cnr);
 	}
 
@@ -338,14 +340,21 @@ void susfs_fp_remove(struct susfs_fp_hook *h)
 	if (native_ours && h->nr >= 0) {
 		err = ksu_patch_text(&sys_call_table_ptr[h->nr], &h->orig,
 				     sizeof(h->orig), KSU_PATCH_TEXT_FLUSH_DCACHE);
-		if (err)
+		if (err) {
+			ok = false;
 			pr_warn("susfs_fp: nr %d restore failed %d\n", h->nr, err);
-		else
+		} else
 			pr_info("susfs_fp: nr %d (%s) disarmed, entry %px restored\n",
 				h->nr, h->name, (void *)h->orig);
 	}
 
+	if (!ok) {
+		pr_err("susfs_fp: %s remains installed after restore failure; module text must not be freed\n",
+			h->name);
+		return -EIO;
+	}
 	h->installed = false;
+	return 0;
 }
 
 /* Wait until nothing can be inside a wrapper before the module text goes away.
