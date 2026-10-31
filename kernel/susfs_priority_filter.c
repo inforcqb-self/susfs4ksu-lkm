@@ -19,13 +19,9 @@
  * resolve under it: prepare_creds() hands back a cred whose SELinux blob is a fresh copy
  * (security_prepare_creds duplicates task_security_struct), so writing its sid is private to
  * this task.  The sid field offset comes from BTF, resolved once at init.
- *   Caveat: the write lands at cred->security + offsetof(task_security_struct, sid), i.e. it
- *   assumes SELinux owns the start of the cred blob (selinux_blob_sizes.lbs_cred == 0, which is
- *   the case on the GKI kernels this targets).  On a kernel that stacks another cred-blob LSM
- *   ahead of SELinux the write lands in the wrong field of the SAME private, throwaway blob -
- *   never out of bounds (the blob is sized for every LSM) and never on the live cred - so the
- *   sid stays the caller's, kern_path() then answers from the caller's domain, and an app-data
- *   read it is not allowed simply fails with EACCES.  A miss, not a crash.
+ *   The SELinux cred-blob base (selinux_blob_sizes.lbs_cred) is resolved separately and both
+ *   offsets must be known before this layer arms.  A layout that cannot be proven is rejected,
+ *   rather than resolving under the caller's domain with a potentially empty filter.
  *
  * Scope: the uids are resolved when the list is set.  Upstream also re-resolves from the
  * KernelSU package observer on reinstall; the LKM does not hook that, so a reinstalled app
@@ -47,6 +43,7 @@
 #include <linux/uaccess.h>
 #include <linux/security.h>		/* security_secctx_to_secid() */
 #include <linux/uidgid.h>
+#include <linux/compat.h>
 #include <linux/resource.h>		/* PRIO_USER */
 #include <linux/ioprio.h>		/* IOPRIO_WHO_USER */
 #include <asm/unistd.h>
@@ -77,11 +74,14 @@ struct prio_uid_bitmap {
 
 static struct prio_uid_bitmap __rcu *prio_bitmap;	/* NULL = nothing filtered */
 static DEFINE_MUTEX(prio_set_lock);			/* serialises the set/replace path */
+static bool prio_active;
 
 /* Resolved once at init. */
 static u32 prio_ksu_sid;			/* sid of u:r:ksu:s0, 0 = unresolved */
 static size_t prio_tsec_sid_off;		/* offset of sid in task_security_struct */
 static bool prio_tsec_sid_ok;			/* the offset above was found */
+static size_t prio_cred_blob_off;
+static bool prio_cred_blob_ok;
 static struct cred *(*prio_prepare_creds)(void);
 
 /* Lockless lookup for the syscall path (the caller already holds rcu_read_lock through the
@@ -103,15 +103,39 @@ static bool prio_uid_filtered(uid_t uid)
 	return hit;
 }
 
+static bool prio_valid_app_name(const char *name)
+{
+	const unsigned char *p = (const unsigned char *)name;
+	size_t len = 0;
+
+	if (!*p || !strcmp(name, ".") || !strcmp(name, ".."))
+		return false;
+	while (*p) {
+		if (len++ >= 255 ||
+		    !((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+		      (*p >= '0' && *p <= '9') || *p == '.' || *p == '_'))
+			return false;
+		p++;
+	}
+	return true;
+}
+
 /* An app (uid >= 10000) asking about a DIFFERENT, filtered uid is the enumeration the feature
  * blocks; a process asking about itself, or a non-app (su/system) caller, sees the truth. */
 static bool prio_should_hide_user(int which, int who, int who_is_user_class)
 {
-	uid_t caller = current_uid().val;
-	uid_t target = (uid_t)who;
+	kuid_t caller_kuid = current_uid();
+	kuid_t target_kuid;
+	uid_t caller;
+	uid_t target;
 
 	if (which != who_is_user_class)		/* only the by-uid form carries a uid in `who` */
 		return false;
+	target_kuid = make_kuid(current_user_ns(), (uid_t)who);
+	if (!uid_valid(target_kuid) || !uid_valid(caller_kuid))
+		return false;
+	caller = from_kuid(&init_user_ns, caller_kuid);
+	target = from_kuid(&init_user_ns, target_kuid);
 	if (caller < PRIO_MIN_UID)		/* not an app: never filtered */
 		return false;
 	if ((target % 100000) == (caller % 100000))	/* asking about self is allowed */
@@ -132,11 +156,16 @@ static susfs_syscall_fn_t prio_orig_getpriority;
 static susfs_syscall_fn_t prio_orig_setpriority;
 static susfs_syscall_fn_t prio_orig_ioprio_get;
 static susfs_syscall_fn_t prio_orig_ioprio_set;
+static susfs_syscall_fn_t prio_orig_compat_getpriority;
+static susfs_syscall_fn_t prio_orig_compat_setpriority;
+static susfs_syscall_fn_t prio_orig_compat_ioprio_get;
+static susfs_syscall_fn_t prio_orig_compat_ioprio_set;
 
-#define PRIO_WRAP(fn, origp, user_class)					\
+#define PRIO_WRAP(fn, origp, compatp, user_class)				\
 static __nocfi noinline long fn(const struct pt_regs *regs)			\
 {										\
-	susfs_syscall_fn_t orig = READ_ONCE(origp);				\
+	susfs_syscall_fn_t orig = is_compat_task() ? READ_ONCE(compatp) :\
+		READ_ONCE(origp);								\
 										\
 	if (!orig)								\
 		return -ENOSYS;							\
@@ -146,24 +175,28 @@ static __nocfi noinline long fn(const struct pt_regs *regs)			\
 	return orig(regs);							\
 }
 
-PRIO_WRAP(prio_w_getpriority,	prio_orig_getpriority,	PRIO_USER)
-PRIO_WRAP(prio_w_setpriority,	prio_orig_setpriority,	PRIO_USER)
-PRIO_WRAP(prio_w_ioprio_get,	prio_orig_ioprio_get,	IOPRIO_WHO_USER)
-PRIO_WRAP(prio_w_ioprio_set,	prio_orig_ioprio_set,	IOPRIO_WHO_USER)
+PRIO_WRAP(prio_w_getpriority, prio_orig_getpriority, prio_orig_compat_getpriority, PRIO_USER)
+PRIO_WRAP(prio_w_setpriority, prio_orig_setpriority, prio_orig_compat_setpriority, PRIO_USER)
+PRIO_WRAP(prio_w_ioprio_get, prio_orig_ioprio_get, prio_orig_compat_ioprio_get, IOPRIO_WHO_USER)
+PRIO_WRAP(prio_w_ioprio_set, prio_orig_ioprio_set, prio_orig_compat_ioprio_set, IOPRIO_WHO_USER)
 
 static struct susfs_fp_hook prio_hooks[] = {
 	{ .nr = __NR_getpriority, .nr_compat = COMPAT_GETPRIORITY_NR,
 	  .name = "priority/getpriority", .sym = "__arm64_sys_getpriority",
-	  .wrapper = prio_w_getpriority, .orig_slot = &prio_orig_getpriority },
+	  .wrapper = prio_w_getpriority, .orig_slot = &prio_orig_getpriority,
+	  .orig_slot_compat = &prio_orig_compat_getpriority },
 	{ .nr = __NR_setpriority, .nr_compat = COMPAT_SETPRIORITY_NR,
 	  .name = "priority/setpriority", .sym = "__arm64_sys_setpriority",
-	  .wrapper = prio_w_setpriority, .orig_slot = &prio_orig_setpriority },
+	  .wrapper = prio_w_setpriority, .orig_slot = &prio_orig_setpriority,
+	  .orig_slot_compat = &prio_orig_compat_setpriority },
 	{ .nr = __NR_ioprio_get, .nr_compat = COMPAT_IOPRIO_GET_NR,
 	  .name = "priority/ioprio_get", .sym = "__arm64_sys_ioprio_get",
-	  .wrapper = prio_w_ioprio_get, .orig_slot = &prio_orig_ioprio_get },
+	  .wrapper = prio_w_ioprio_get, .orig_slot = &prio_orig_ioprio_get,
+	  .orig_slot_compat = &prio_orig_compat_ioprio_get },
 	{ .nr = __NR_ioprio_set, .nr_compat = COMPAT_IOPRIO_SET_NR,
 	  .name = "priority/ioprio_set", .sym = "__arm64_sys_ioprio_set",
-	  .wrapper = prio_w_ioprio_set, .orig_slot = &prio_orig_ioprio_set },
+	  .wrapper = prio_w_ioprio_set, .orig_slot = &prio_orig_ioprio_set,
+	  .orig_slot_compat = &prio_orig_compat_ioprio_set },
 };
 
 /* ---- uid resolution (set path only; sleeps, runs in the supercall task_work) ---- */
@@ -183,7 +216,8 @@ static __nocfi const struct cred *prio_enter_ksu_domain(struct cred **made)
 	if (!nc)
 		return NULL;
 	if (nc->security)
-		*(u32 *)((char *)nc->security + prio_tsec_sid_off) = prio_ksu_sid;
+		*(u32 *)((char *)nc->security + prio_cred_blob_off +
+			 prio_tsec_sid_off) = prio_ksu_sid;
 	*made = nc;
 	return override_creds(nc);
 }
@@ -205,7 +239,10 @@ static int prio_resolve_uid(const char *pkg, uid_t *out)
 	uid_t uid;
 	int rc;
 
-	if (scnprintf(pathbuf, sizeof(pathbuf), "/data/data/%s", pkg) >= (int)sizeof(pathbuf) - 1)
+	if (!prio_valid_app_name(pkg))
+		return -EINVAL;
+	if (scnprintf(pathbuf, sizeof(pathbuf), "/data/data/%s", pkg) >=
+	    (int)sizeof(pathbuf) - 1)
 		return -ENAMETOOLONG;
 
 	old = prio_enter_ksu_domain(&made);
@@ -282,14 +319,19 @@ void susfs_priority_filter_supercall(void __user **arg)
 		goto out_free;		/* nb freed below, old list left in place */
 
 	mutex_lock(&prio_set_lock);
+	if (!prio_active) {
+		mutex_unlock(&prio_set_lock);
+		err = -ENODEV;
+		goto out_free;
+	}
 	ob = rcu_dereference_protected(prio_bitmap, lockdep_is_held(&prio_set_lock));
 	rcu_assign_pointer(prio_bitmap, nb);
-	mutex_unlock(&prio_set_lock);
 	nb = NULL;			/* published; do not free */
 	if (ob) {
 		synchronize_rcu();
 		kfree(ob);
 	}
+	mutex_unlock(&prio_set_lock);
 	err = 0;
 
 out_free:
@@ -328,23 +370,48 @@ int susfs_priority_filter_init(void)
 		prio_tsec_sid_ok = false;
 		pr_warn("priority_filter: task_security_struct.sid offset not found in BTF - will resolve in the caller's domain\n");
 	}
-	if (!prio_prepare_creds)
-		pr_warn("priority_filter: prepare_creds not resolvable - will resolve in the caller's domain\n");
+	{
+		unsigned long blob_sizes = find_kernel_symbol_exact("selinux_blob_sizes");
+		int blob_off = 0;
+
+		if (blob_sizes && susfs_btf_member_offset("lsm_blob_sizes", "lbs_cred",
+								"int", &off))
+			return -ENOENT;
+		if (blob_sizes)
+			blob_off = READ_ONCE(*(int *)((char *)blob_sizes + off));
+		if (blob_off < 0 || blob_off > 4096)
+			return -EINVAL;
+		prio_cred_blob_off = (size_t)blob_off;
+		prio_cred_blob_ok = true;
+	}
+	if (!prio_prepare_creds || !prio_ksu_sid || !prio_tsec_sid_ok ||
+	    !prio_cred_blob_ok)
+		pr_warn("priority_filter: private SELinux cred layout unavailable - feature stays off\n");
+
+	if (!prio_prepare_creds || !prio_ksu_sid || !prio_tsec_sid_ok ||
+	    !prio_cred_blob_ok)
+		return -ENOENT;
 
 	for (i = 0; i < (int)ARRAY_SIZE(prio_hooks); i++) {
 		rc = susfs_fp_install(&prio_hooks[i]);
 		if (rc) {
-			pr_warn("priority_filter: %s not installed (%d) - that syscall answers the kernel's own way\n",
+			pr_warn("priority_filter: %s not installed (%d) - rolling back the complete feature\n",
 				prio_hooks[i].name, rc);
-			continue;
+			while (i > 0) {
+				--i;
+				if (prio_hooks[i].installed)
+					susfs_fp_remove(&prio_hooks[i]);
+			}
+			susfs_fp_drain();
+			return rc;
 		}
 		installed++;
 	}
-	if (!installed) {
-		pr_warn("priority_filter: none of the %u priority entries could be installed\n",
-			(unsigned int)ARRAY_SIZE(prio_hooks));
+	if (installed != (int)ARRAY_SIZE(prio_hooks))
 		return -ENOENT;
-	}
+	mutex_lock(&prio_set_lock);
+	prio_active = true;
+	mutex_unlock(&prio_set_lock);
 
 	SUSFS_LOGI("priority_filter armed: %d of %u entries answer -ESRCH for filtered app uids\n",
 		   installed, (unsigned int)ARRAY_SIZE(prio_hooks));
@@ -367,11 +434,12 @@ void susfs_priority_filter_exit(void)
 		susfs_fp_drain();
 
 	mutex_lock(&prio_set_lock);
+	prio_active = false;
 	b = rcu_dereference_protected(prio_bitmap, lockdep_is_held(&prio_set_lock));
 	rcu_assign_pointer(prio_bitmap, NULL);
-	mutex_unlock(&prio_set_lock);
 	if (b) {
 		synchronize_rcu();
 		kfree(b);
 	}
+	mutex_unlock(&prio_set_lock);
 }
